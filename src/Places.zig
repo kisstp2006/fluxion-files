@@ -108,8 +108,20 @@ fn readBookmarks(self: *Places, io: std.Io) void {
         if (!std.mem.startsWith(u8, uri, "file://")) continue;
         const path = unescape(a, uri["file://".len..]) orelse continue;
         const name = if (uri_end < line.len) std.mem.trim(u8, line[uri_end + 1 ..], " ") else std.fs.path.basename(path);
+        // A folder listed already - a person's folder GTK bookmarks too, or
+        // a line there twice - is listed once, as Windows lists a pin.
+        if (self.listed(path)) continue;
         self.pinned.append(a, .{ .name = name, .path = path }) catch {};
     }
+}
+
+/// Whether `path` is among the person's folders or the pins already,
+/// a slash at its end aside.
+fn listed(self: *const Places, path: []const u8) bool {
+    const bare = if (path.len > 1) std.mem.trimEnd(u8, path, "/") else path;
+    for (self.user.items) |f| if (std.mem.eql(u8, f.path, bare)) return true;
+    for (self.pinned.items) |f| if (std.mem.eql(u8, f.path, bare)) return true;
+    return false;
 }
 
 /// `%20` and the rest, as a URI has them.
@@ -331,16 +343,28 @@ pub fn isPinned(self: *const Places, path: []const u8) bool {
     return false;
 }
 
-/// The user folder that `path` is, if it is one.
 /// Where a person's folder is: their Desktop, their Documents.
 pub fn pathOf(self: *const Places, which: Special) ?[]const u8 {
     for (self.user.items) |f| if (f.special == which) return f.path;
     return null;
 }
 
+/// The user folder that `path` is, if it is one.
 pub fn specialOf(self: *const Places, path: []const u8) ?Special {
     for (self.user.items) |f| if (std.mem.eql(u8, f.path, path)) return f.special;
     return null;
+}
+
+test "a folder bookmarked twice, or a person's folder bookmarked, is listed once" {
+    var places: Places = .{ .arena = .init(std.testing.allocator) };
+    defer places.deinit();
+    const a = places.arena.allocator();
+    try places.user.append(a, .{ .name = "Downloads", .path = "/home/p/Downloads", .special = .downloads });
+    try places.pinned.append(a, .{ .name = "src", .path = "/home/p/src" });
+    try std.testing.expect(places.listed("/home/p/Downloads"));
+    try std.testing.expect(places.listed("/home/p/Downloads/"));
+    try std.testing.expect(places.listed("/home/p/src"));
+    try std.testing.expect(!places.listed("/home/p/Music"));
 }
 
 test "user-dirs.dirs is read as xdg-user-dirs writes it" {

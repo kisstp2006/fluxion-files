@@ -75,6 +75,13 @@ this_pc_open: bool = true,
 /// in its tree.
 quick_open: bool = true,
 nav_opened: std.ArrayList(nav.Opened) = .empty,
+/// The row of the pane last clicked, and the folder it went to: while
+/// that folder is shown, that row - and only it - is lit, though the
+/// folder is in the tree more than once.
+nav_chosen_buffer: [160]u8 = undefined,
+nav_chosen_len: usize = 0,
+nav_chosen_path_buffer: [std.fs.max_path_bytes]u8 = undefined,
+nav_chosen_path_len: usize = 0,
 /// The address bar's "›" opened: the folders in the crumb before it, and
 /// which "›" it was.
 crumb_list: ?nav.Opened = null,

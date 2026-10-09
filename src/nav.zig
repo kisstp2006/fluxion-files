@@ -99,6 +99,8 @@ pub fn forget(self: *Files) void {
 const Going = struct {
     to: ?Tab.Location = null,
     buffer: [std.fs.max_path_bytes]u8 = undefined,
+    /// A row lit this drawing already.
+    lit: bool = false,
 
     fn folder(self: *Going, path: []const u8) void {
         self.to = .{ .folder = std.fmt.bufPrint(&self.buffer, "{s}", .{path}) catch path };
@@ -186,14 +188,16 @@ fn drives(self: *Files, kit: *Kit, going: *Going, chevrons: bool) void {
 /// A folder's row, and - opened - the folders in it under it, each a
 /// row that opens in turn.
 fn folderRow(self: *Files, kit: *Kit, going: *Going, id: []const u8, depth: u8, path: []const u8, name: []const u8, icon: []const u8, pinned: bool, chevrons: bool) void {
-    const here = self.tab().location;
-    const lit = here == .folder and std.mem.eql(u8, here.folder, path);
     const opened = openedAt(self, path);
     // The id is a print of the kit's: kept before the rows under it print.
     var id_buffer: [128]u8 = undefined;
     const own_id = std.fmt.bufPrint(&id_buffer, "{s}", .{id}) catch id;
+    const lit = isLit(self, going, own_id, path);
     switch (row(self, kit, own_id, depth, .{ .themed = icon }, name, lit, if (chevrons) opened != null else null, pinned)) {
-        .go => going.folder(path),
+        .go => {
+            going.folder(path);
+            choose(self, own_id, path);
+        },
         .toggle => {
             toggle(self, path);
             self.window.redraw();
@@ -212,6 +216,29 @@ fn folderRow(self: *Files, kit: *Kit, going: *Going, id: []const u8, depth: u8, 
         // A row opened or closed under it: the list walked is not the same.
         if (at >= self.nav_opened.items.len or self.nav_opened.items[at].children.ptr != children.ptr) return;
     }
+}
+
+/// Whether the row `id`, of the folder `path`, is lit: the one clicked to
+/// go there while it is shown - a folder can be in the tree more than
+/// once - or, come to some other way, the first of it.
+fn isLit(self: *Files, going: *Going, id: []const u8, path: []const u8) bool {
+    const here = self.tab().location;
+    if (here != .folder or !std.mem.eql(u8, here.folder, path)) return false;
+    const chosen_path = self.nav_chosen_path_buffer[0..self.nav_chosen_path_len];
+    const lit = if (std.mem.eql(u8, chosen_path, path))
+        std.mem.eql(u8, self.nav_chosen_buffer[0..self.nav_chosen_len], id)
+    else
+        !going.lit;
+    if (lit) going.lit = true;
+    return lit;
+}
+
+/// The row `id` clicked, to go to `path`.
+fn choose(self: *Files, id: []const u8, path: []const u8) void {
+    self.nav_chosen_len = @min(id.len, self.nav_chosen_buffer.len);
+    @memcpy(self.nav_chosen_buffer[0..self.nav_chosen_len], id[0..self.nav_chosen_len]);
+    self.nav_chosen_path_len = @min(path.len, self.nav_chosen_path_buffer.len);
+    @memcpy(self.nav_chosen_path_buffer[0..self.nav_chosen_path_len], path[0..self.nav_chosen_path_len]);
 }
 
 fn separator(kit: *Kit) void {
