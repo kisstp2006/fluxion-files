@@ -9,17 +9,21 @@ const std = @import("std");
 const Files = @import("Files.zig");
 const Tab = @import("Tab.zig");
 const Ops = @import("Ops.zig");
+const Look = @import("Look.zig");
+const apps = @import("apps.zig");
 
 const log = std.log.scoped(.actions);
 
-/// The full paths of what is chosen, into `out`.
+/// The full paths of what is chosen, into `out`: each where it is - a
+/// search's findings in their own folders.
 fn chosenPaths(self: *Files, out: *std.ArrayList([]u8)) void {
     const t = self.tab();
-    const dir = t.path() orelse return;
     for (t.selected.items, 0..) |s, i| {
         if (!s) continue;
+        const e = t.entry(i);
+        const dir = t.dirOf(e) orelse continue;
         var buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const full = Ops.join(&buffer, dir, t.entry(i).name) catch continue;
+        const full = Ops.join(&buffer, dir, e.name) catch continue;
         out.append(self.gpa, self.gpa.dupe(u8, full) catch continue) catch {};
     }
 }
@@ -125,8 +129,9 @@ pub fn choose(self: *Files, names: []const []const u8) void {
 pub fn delete(self: *Files, permanent: bool) void {
     const t = self.tab();
     const n = t.selectedCount();
-    if (n == 0 or t.path() == null) return;
-    if (permanent) {
+    if (n == 0 or !t.lists()) return;
+    // From the Recycle Bin, nothing is deleted but for good.
+    if (permanent or t.location == .trash) {
         self.confirm = .delete_permanently;
         self.window.redraw();
         return;
@@ -135,6 +140,20 @@ pub fn delete(self: *Files, permanent: bool) void {
 }
 
 pub fn deleteChosen(self: *Files, permanent: bool) void {
+    const t = self.tab();
+    if (t.location == .trash) {
+        var trash_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const bin = Ops.homeTrash(&trash_buffer) orelse return;
+        var failed: ?anyerror = null;
+        for (0..t.count()) |i| {
+            if (!t.selected.items[i]) continue;
+            Ops.purge(self.io, bin, t.entry(i).stored orelse continue) catch |err| {
+                failed = err;
+            };
+        }
+        if (failed) |err| self.notify("Some items could not be deleted", err);
+        return self.refreshAll();
+    }
     var paths: std.ArrayList([]u8) = .empty;
     defer {
         for (paths.items) |p| self.gpa.free(p);
@@ -218,4 +237,306 @@ pub fn copyAsPath(self: *Files) void {
         text.append(self.gpa, '"') catch {};
     }
     self.window.copyText(text.items);
+}
+
+/// Pin to Quick access: the chosen folders - or, none chosen, the folder
+/// shown - or take them off where they are pinned already.
+pub fn pinChosen(self: *Files) void {
+    const t = self.tab();
+    var paths: std.ArrayList([]u8) = .empty;
+    defer {
+        for (paths.items) |p| self.gpa.free(p);
+        paths.deinit(self.gpa);
+    }
+    chosenPaths(self, &paths);
+    if (paths.items.len == 0) if (t.path()) |p| paths.append(self.gpa, self.gpa.dupe(u8, p) catch return) catch {};
+    for (paths.items) |p| {
+        var kind = std.Io.Dir.cwd().statFile(self.io, p, .{}) catch continue;
+        if (kind.kind != .directory) continue;
+        _ = &kind;
+        self.places.togglePin(self.io, p);
+    }
+    self.window.redraw();
+}
+
+/// Windows 10's Move to and Copy to: what is chosen, into `to`.
+pub fn sendTo(self: *Files, to: []const u8, moving: bool) void {
+    var paths: std.ArrayList([]u8) = .empty;
+    defer {
+        for (paths.items) |p| self.gpa.free(p);
+        paths.deinit(self.gpa);
+    }
+    chosenPaths(self, &paths);
+    var failed: ?anyerror = null;
+    for (paths.items) |source| {
+        var buffer: [512]u8 = undefined;
+        _ = (if (moving) Ops.moveInto(self.io, source, to, &buffer) else Ops.copyInto(self.io, source, to, &buffer)) catch |err| {
+            failed = err;
+        };
+    }
+    if (failed) |err| self.notify(if (moving) "Some items could not be moved" else "Some items could not be copied", err);
+    self.refreshAll();
+}
+
+/// A shortcut to each chosen, beside it: "report - Shortcut.pdf".
+pub fn createShortcut(self: *Files) void {
+    var paths: std.ArrayList([]u8) = .empty;
+    defer {
+        for (paths.items) |p| self.gpa.free(p);
+        paths.deinit(self.gpa);
+    }
+    chosenPaths(self, &paths);
+    var names: std.ArrayList([]u8) = .empty;
+    defer {
+        for (names.items) |n| self.gpa.free(n);
+        names.deinit(self.gpa);
+    }
+    var failed: ?anyerror = null;
+    for (paths.items) |target| {
+        var buffer: [512]u8 = undefined;
+        const name = Ops.shortcut(self.io, target, std.fs.path.dirname(target) orelse "/", &buffer) catch |err| {
+            failed = err;
+            continue;
+        };
+        names.append(self.gpa, self.gpa.dupe(u8, name) catch continue) catch {};
+    }
+    if (failed) |err| self.notify("The shortcut could not be created", err);
+    self.refreshAll();
+    choose(self, names.items);
+}
+
+/// Paste shortcut: a shortcut here to each of what was copied.
+pub fn pasteShortcut(self: *Files) void {
+    const dir = self.tab().path() orelse return;
+    var failed: ?anyerror = null;
+    for (self.clipboard.items) |target| {
+        var buffer: [512]u8 = undefined;
+        _ = Ops.shortcut(self.io, target, dir, &buffer) catch |err| {
+            failed = err;
+        };
+    }
+    if (failed) |err| self.notify("Some shortcuts could not be created", err);
+    self.refreshAll();
+}
+
+/// Send to ▸ Desktop (create shortcut).
+pub fn shortcutOnDesktop(self: *Files) void {
+    const desktop = self.places.pathOf(.desktop) orelse return;
+    var paths: std.ArrayList([]u8) = .empty;
+    defer {
+        for (paths.items) |p| self.gpa.free(p);
+        paths.deinit(self.gpa);
+    }
+    chosenPaths(self, &paths);
+    var failed: ?anyerror = null;
+    for (paths.items) |target| {
+        var buffer: [512]u8 = undefined;
+        _ = Ops.shortcut(self.io, target, desktop, &buffer) catch |err| {
+            failed = err;
+        };
+    }
+    if (failed) |err| self.notify("The shortcut could not be created", err);
+    self.refreshAll();
+}
+
+/// Open with ▸ an app: the chosen file in it.
+pub fn openWith(self: *Files, app: *const apps.App) void {
+    var paths: std.ArrayList([]u8) = .empty;
+    defer {
+        for (paths.items) |p| self.gpa.free(p);
+        paths.deinit(self.gpa);
+    }
+    chosenPaths(self, &paths);
+    for (paths.items) |p| apps.runWith(self.gpa, self.io, app.name, app.exec, p);
+}
+
+/// Eject: a drive that comes and goes unmounted and turned off, by
+/// udisks, as the desktop's own would.
+pub fn eject(self: *Files, d: @import("Places.zig").Drive) void {
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(self.gpa);
+    line.appendSlice(self.gpa, "udisksctl unmount -b ") catch return;
+    quote(self, &line, d.device);
+    line.appendSlice(self.gpa, " && udisksctl power-off -b ") catch return;
+    quote(self, &line, d.device);
+    apps.run(self.gpa, self.io, "Eject", line.items, null);
+}
+
+/// Email: the chosen files attached to a new mail, in the mail app.
+pub fn email(self: *Files) void {
+    var paths: std.ArrayList([]u8) = .empty;
+    defer {
+        for (paths.items) |p| self.gpa.free(p);
+        paths.deinit(self.gpa);
+    }
+    chosenPaths(self, &paths);
+    if (paths.items.len == 0) return;
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(self.gpa);
+    line.appendSlice(self.gpa, "xdg-email") catch return;
+    for (paths.items) |p| {
+        line.appendSlice(self.gpa, " --attach ") catch return;
+        quote(self, &line, p);
+    }
+    apps.run(self.gpa, self.io, "Email", line.items, null);
+}
+
+/// Zip: the chosen files into a compressed folder beside them, named after
+/// the first, as Windows names it - through bsdtar until libarchive is
+/// read here itself.
+pub fn zip(self: *Files) void {
+    const t = self.tab();
+    const dir = t.path() orelse return;
+    const first = t.current() orelse return;
+    var name_buffer: [512]u8 = undefined;
+    const stem = std.fs.path.stem(t.entry(first).name);
+    var wanted_buffer: [512]u8 = undefined;
+    const wanted = std.fmt.bufPrint(&wanted_buffer, "{s}.zip", .{if (stem.len > 0) stem else t.entry(first).name}) catch return;
+    const name = Ops.freeName(self.io, dir, wanted, false, false, &name_buffer);
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(self.gpa);
+    line.appendSlice(self.gpa, "cd ") catch return;
+    quote(self, &line, dir);
+    line.appendSlice(self.gpa, " && bsdtar -a -cf ") catch return;
+    quote(self, &line, name);
+    for (t.selected.items, 0..) |s, i| {
+        if (!s) continue;
+        line.append(self.gpa, ' ') catch return;
+        quote(self, &line, t.entry(i).name);
+    }
+    apps.run(self.gpa, self.io, "Zip", line.items, null);
+}
+
+/// A terminal in the folder shown.
+pub fn terminalHere(self: *Files) void {
+    terminalIn(self, self.tab().path() orelse return);
+}
+
+/// Open in Terminal on the one folder chosen - or, with none, the folder
+/// shown.
+pub fn terminalChosen(self: *Files) void {
+    const t = self.tab();
+    if (t.selectedCount() == 1) if (t.current()) |i| {
+        const e = t.entry(i);
+        if (e.isFolder()) if (t.dirOf(e)) |dir| {
+            var buffer: [std.fs.max_path_bytes]u8 = undefined;
+            return terminalIn(self, Ops.join(&buffer, dir, e.name) catch return);
+        };
+    };
+    terminalHere(self);
+}
+
+pub fn terminalIn(self: *Files, dir: []const u8) void {
+    const apps_list = self.installedApps() orelse return;
+    const terminals = [_][]const u8{ "org.gnome.Ptyxis.desktop", "org.gnome.Console.desktop", "org.gnome.Terminal.desktop", "org.kde.konsole.desktop", "foot.desktop", "kitty.desktop", "Alacritty.desktop" };
+    const app = apps.firstOf(apps_list, &terminals) orelse return self.notify("No terminal is installed", error.FileNotFound);
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(self.gpa);
+    line.appendSlice(self.gpa, "cd ") catch return;
+    quote(self, &line, dir);
+    line.appendSlice(self.gpa, " && ") catch return;
+    const exec = apps.commandLine(self.gpa, app.exec) catch return;
+    defer self.gpa.free(exec);
+    line.appendSlice(self.gpa, exec) catch return;
+    apps.run(self.gpa, self.io, app.name, line.items, null);
+}
+
+/// The chosen picture as the desktop's background: in Settings' file,
+/// where the shell takes it from.
+pub fn setAsBackground(self: *Files) void {
+    const t = self.tab();
+    const i = t.current() orelse return;
+    const e = t.entry(i);
+    const dir = t.dirOf(e) orelse return;
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const full = Ops.join(&buffer, dir, e.name) catch return;
+    var path_buffer: [512]u8 = undefined;
+    const file = Look.path(&path_buffer) orelse return;
+    var text_buffer: [16384]u8 = undefined;
+    const was = std.Io.Dir.cwd().readFile(self.io, file, &text_buffer) catch "";
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(self.gpa);
+    setKey(self.gpa, &out, was, "desktop", "wallpaper", full) catch return;
+    std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = file, .data = out.items }) catch |err| self.notify("The background could not be set", err);
+}
+
+/// `text` with `key=value` in `[section]` - replaced where it is, added
+/// where it is not.
+pub fn setKey(gpa: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8, section: []const u8, key: []const u8, value: []const u8) !void {
+    var current: []const u8 = "";
+    var done = false;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var first = true;
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len > 0 and line[0] == '[') {
+            // Leaving the section without the key: it goes at its end.
+            if (!done and std.mem.eql(u8, current, section)) {
+                try out.print(gpa, "{s}={s}\n", .{ key, value });
+                done = true;
+            }
+            current = std.mem.trim(u8, line, "[]");
+        }
+        if (!done and std.mem.eql(u8, current, section)) if (std.mem.indexOfScalar(u8, line, '=')) |eq| {
+            if (std.mem.eql(u8, std.mem.trim(u8, line[0..eq], " "), key)) {
+                if (!first) try out.append(gpa, '\n');
+                first = false;
+                try out.print(gpa, "{s}={s}", .{ key, value });
+                done = true;
+                continue;
+            }
+        };
+        if (!first) try out.append(gpa, '\n');
+        first = false;
+        try out.appendSlice(gpa, raw);
+    }
+    if (!done) {
+        if (!std.mem.eql(u8, current, section)) try out.print(gpa, "\n[{s}]\n", .{section}) else try out.append(gpa, '\n');
+        try out.print(gpa, "{s}={s}\n", .{ key, value });
+    }
+}
+
+/// The Recycle Bin's chosen items - or, none chosen, all of them - back
+/// where they were.
+pub fn restore(self: *Files, all: bool) void {
+    const t = self.tab();
+    if (t.location != .trash) return;
+    var trash_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const trash = Ops.homeTrash(&trash_buffer) orelse return;
+    var failed: ?anyerror = null;
+    for (0..t.count()) |i| {
+        if (!all and !t.selected.items[i]) continue;
+        const e = t.entry(i);
+        const stored = e.stored orelse continue;
+        Ops.restore(self.io, trash, stored, e.dir orelse "/", e.name) catch |err| {
+            failed = err;
+        };
+    }
+    if (failed) |err| self.notify("Some items could not be restored", err);
+    self.refreshAll();
+}
+
+/// The Recycle Bin emptied, everything in it gone for good.
+pub fn emptyTrash(self: *Files) void {
+    var trash_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const trash = Ops.homeTrash(&trash_buffer) orelse return;
+    Ops.emptyTrash(self.io, trash) catch |err| self.notify("The Recycle Bin could not be emptied", err);
+    self.refreshAll();
+}
+
+fn quote(self: *Files, out: *std.ArrayList(u8), text: []const u8) void {
+    out.append(self.gpa, '\'') catch return;
+    for (text) |c| if (c == '\'') out.appendSlice(self.gpa, "'\\''") catch return else out.append(self.gpa, c) catch return;
+    out.append(self.gpa, '\'') catch return;
+}
+
+test "a key is set in its section, replaced or added" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try setKey(gpa, &out, "[appearance]\nmode=dark\n[desktop]\nwallpaper=/old.png\nslideshow=false\n", "desktop", "wallpaper", "/new.png");
+    try std.testing.expectEqualStrings("[appearance]\nmode=dark\n[desktop]\nwallpaper=/new.png\nslideshow=false\n", out.items);
+    out.clearRetainingCapacity();
+    try setKey(gpa, &out, "[appearance]\nmode=dark\n", "desktop", "wallpaper", "/a.png");
+    try std.testing.expectEqualStrings("[appearance]\nmode=dark\n\n[desktop]\nwallpaper=/a.png\n", out.items);
 }

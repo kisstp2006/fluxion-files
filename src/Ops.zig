@@ -235,6 +235,180 @@ fn deviceOf(path: []const u8) ?u64 {
     return (@as(u64, sx.dev_major) << 32) | sx.dev_minor;
 }
 
+/// `stored` in the Recycle Bin back as `name` in `dir` - under a name
+/// free there - and its `.trashinfo` gone.
+pub fn restore(io: std.Io, bin: []const u8, stored: []const u8, dir: []const u8, name: []const u8) !void {
+    var from_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const from = try std.fmt.bufPrint(&from_buffer, "{s}/files/{s}", .{ bin, stored });
+    std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+    const kind = (try std.Io.Dir.cwd().statFile(io, from, .{ .follow_symlinks = false })).kind;
+    var name_buffer: [512]u8 = undefined;
+    const free = freeName(io, dir, name, kind == .directory, false, &name_buffer);
+    var to_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const to = try join(&to_buffer, dir, free);
+    std.Io.Dir.renameAbsolute(from, to, io) catch |err| switch (err) {
+        error.CrossDevice => {
+            try copyTree(io, from, to, 0);
+            try deletePermanently(io, from);
+        },
+        else => return err,
+    };
+    var info_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    std.Io.Dir.cwd().deleteFile(io, try std.fmt.bufPrint(&info_buffer, "{s}/info/{s}.trashinfo", .{ bin, stored })) catch {};
+}
+
+/// `stored` in the Recycle Bin gone for good, and its record with it.
+pub fn purge(io: std.Io, bin: []const u8, stored: []const u8) !void {
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    try deletePermanently(io, try std.fmt.bufPrint(&buffer, "{s}/files/{s}", .{ bin, stored }));
+    std.Io.Dir.cwd().deleteFile(io, try std.fmt.bufPrint(&buffer, "{s}/info/{s}.trashinfo", .{ bin, stored })) catch {};
+}
+
+/// A shortcut to `target` in `dir`, as Windows makes one - "report -
+/// Shortcut.pdf" - here a symbolic link. The name it got.
+pub fn shortcut(io: std.Io, target: []const u8, dir: []const u8, buffer: []u8) ![]const u8 {
+    const kind = (try std.Io.Dir.cwd().statFile(io, target, .{})).kind;
+    const stem, const ext = splitExtension(std.fs.path.basename(target), kind == .directory);
+    var wanted_buffer: [512]u8 = undefined;
+    const wanted = try std.fmt.bufPrint(&wanted_buffer, "{s} - Shortcut{s}", .{ stem, ext });
+    const name = freeName(io, dir, wanted, kind == .directory, false, buffer);
+    var link_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    try std.Io.Dir.cwd().symLink(io, target, try join(&link_buffer, dir, name), .{ .is_directory = kind == .directory });
+    return name;
+}
+
+/// Everything in the Recycle Bin gone for good, and its records with it.
+pub fn emptyTrash(io: std.Io, bin: []const u8) !void {
+    for ([_][]const u8{ "files", "info" }) |part| {
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrint(&buffer, "{s}/{s}", .{ bin, part });
+        var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch continue;
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (try it.next(io)) |entry| dir.deleteTree(io, entry.name) catch {};
+    }
+}
+
+// -------------------------------------------------------------------------
+// What a file is
+// -------------------------------------------------------------------------
+
+fn statxOf(path: []const u8, follow: bool, mask: linux.STATX) ?linux.Statx {
+    var z: [std.fs.max_path_bytes + 1]u8 = undefined;
+    if (path.len >= z.len) return null;
+    @memcpy(z[0..path.len], path);
+    z[path.len] = 0;
+    var sx: linux.Statx = undefined;
+    const rc = linux.statx(linux.AT.FDCWD, @ptrCast(&z), if (follow) 0 else linux.AT.SYMLINK_NOFOLLOW, mask, &sx);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    return sx;
+}
+
+/// When the file was made, where the filesystem keeps it: nanoseconds.
+pub fn created(io: std.Io, path: []const u8) ?i128 {
+    _ = io;
+    const sx = statxOf(path, true, .{ .BTIME = true }) orelse return null;
+    if (!sx.mask.BTIME) return null;
+    return @as(i128, sx.btime.sec) * std.time.ns_per_s + sx.btime.nsec;
+}
+
+/// What a file is, for its properties: its mode, its owner and group, its
+/// times, and how much of the disk it takes.
+pub const Info = struct {
+    mode: u32 = 0,
+    uid: u32 = 0,
+    gid: u32 = 0,
+    size: u64 = 0,
+    on_disk: u64 = 0,
+    accessed: i128 = 0,
+    modified: i128 = 0,
+    created: ?i128 = null,
+};
+
+pub fn info(path: []const u8) ?Info {
+    const sx = statxOf(path, true, .{ .TYPE = true, .MODE = true, .UID = true, .GID = true, .SIZE = true, .BLOCKS = true, .ATIME = true, .MTIME = true, .BTIME = true }) orelse return null;
+    return .{
+        .mode = sx.mode,
+        .uid = sx.uid,
+        .gid = sx.gid,
+        .size = sx.size,
+        .on_disk = sx.blocks * 512,
+        .accessed = @as(i128, sx.atime.sec) * std.time.ns_per_s + sx.atime.nsec,
+        .modified = @as(i128, sx.mtime.sec) * std.time.ns_per_s + sx.mtime.nsec,
+        .created = if (sx.mask.BTIME) @as(i128, sx.btime.sec) * std.time.ns_per_s + sx.btime.nsec else null,
+    };
+}
+
+/// What a folder holds, all the way down: its files, its folders, their
+/// bytes and the disk they take - counted to a limit, a home's worth.
+pub const Usage = struct { files: u64 = 0, folders: u64 = 0, bytes: u64 = 0, on_disk: u64 = 0, partial: bool = false };
+
+pub fn usage(io: std.Io, path: []const u8) Usage {
+    var out: Usage = .{};
+    var stack: [64][]u8 = undefined;
+    var depth: usize = 0;
+    var arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    stack[0] = a.dupe(u8, path) catch return out;
+    depth = 1;
+    var seen: usize = 0;
+    while (depth > 0) {
+        depth -= 1;
+        const dir_path = stack[depth];
+        var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch continue;
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (it.next(io) catch null) |entry| {
+            seen += 1;
+            if (seen > 200_000) {
+                out.partial = true;
+                return out;
+            }
+            var buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const full = join(&buffer, dir_path, entry.name) catch continue;
+            const sx = statxOf(full, false, .{ .TYPE = true, .SIZE = true, .BLOCKS = true }) orelse continue;
+            out.on_disk += sx.blocks * 512;
+            if (entry.kind == .directory) {
+                out.folders += 1;
+                if (depth < stack.len) {
+                    stack[depth] = a.dupe(u8, full) catch continue;
+                    depth += 1;
+                } else out.partial = true;
+            } else {
+                out.files += 1;
+                out.bytes += sx.size;
+            }
+        }
+    }
+    return out;
+}
+
+/// Its mode bits, all twelve, set to `mode`.
+pub fn setMode(path: []const u8, mode: u32) !void {
+    var z: [std.fs.max_path_bytes + 1]u8 = undefined;
+    if (path.len >= z.len) return error.NameTooLong;
+    @memcpy(z[0..path.len], path);
+    z[path.len] = 0;
+    if (std.c.chmod(@ptrCast(&z), @intCast(mode & 0o7777)) != 0) return error.AccessDenied;
+}
+
+const Passwd = extern struct { name: ?[*:0]const u8, passwd: ?[*:0]const u8, uid: u32, gid: u32, gecos: ?[*:0]const u8, dir: ?[*:0]const u8, shell: ?[*:0]const u8 };
+const Group = extern struct { name: ?[*:0]const u8, passwd: ?[*:0]const u8, gid: u32, members: ?*anyopaque };
+extern fn getpwuid(uid: u32) ?*Passwd;
+extern fn getgrgid(gid: u32) ?*Group;
+
+/// The name of user `uid`, or its number.
+pub fn userName(uid: u32, buffer: []u8) []const u8 {
+    if (getpwuid(uid)) |pw| if (pw.name) |n| return std.fmt.bufPrint(buffer, "{s}", .{std.mem.span(n)}) catch "";
+    return std.fmt.bufPrint(buffer, "{d}", .{uid}) catch "";
+}
+
+pub fn groupName(gid: u32, buffer: []u8) []const u8 {
+    if (getgrgid(gid)) |g| if (g.name) |n| return std.fmt.bufPrint(buffer, "{s}", .{std.mem.span(n)}) catch "";
+    return std.fmt.bufPrint(buffer, "{d}", .{gid}) catch "";
+}
+
 // -------------------------------------------------------------------------
 // Gone for good, copied, moved
 // -------------------------------------------------------------------------
@@ -311,6 +485,22 @@ fn copyTree(io: std.Io, source: []const u8, dest: []const u8, depth: u8) !void {
     }
 }
 
+test "a shortcut is a link named as Windows names one" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "report.pdf", .data = "x" });
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = path_buffer[0..try tmp.dir.realPath(io, &path_buffer)];
+    var target_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const target = try join(&target_buffer, root, "report.pdf");
+    var buffer: [512]u8 = undefined;
+    try std.testing.expectEqualStrings("report - Shortcut.pdf", try shortcut(io, target, root, &buffer));
+    try std.testing.expectEqualStrings("report - Shortcut (2).pdf", try shortcut(io, target, root, &buffer));
+    var link_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(target, link_buffer[0..try tmp.dir.readLink(io, "report - Shortcut.pdf", &link_buffer)]);
+}
+
 test "free names are made as Windows makes them" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -365,9 +555,9 @@ test "the trash keeps where a file was" {
     try trashInto(io, file, trash_dir);
     try tmp.dir.access(io, "Trash/files/my file.txt", .{});
     var info_buffer: [1024]u8 = undefined;
-    const info = try tmp.dir.readFile(io, "Trash/info/my file.txt.trashinfo", &info_buffer);
-    try std.testing.expect(std.mem.indexOf(u8, info, "my%20file.txt") != null);
-    try std.testing.expect(std.mem.indexOf(u8, info, "DeletionDate=") != null);
+    const written = try tmp.dir.readFile(io, "Trash/info/my file.txt.trashinfo", &info_buffer);
+    try std.testing.expect(std.mem.indexOf(u8, written, "my%20file.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "DeletionDate=") != null);
     // A second of the same name is numbered.
     try tmp.dir.writeFile(io, .{ .sub_path = "my file.txt", .data = "y" });
     try trashInto(io, file, trash_dir);

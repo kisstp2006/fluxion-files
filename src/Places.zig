@@ -38,6 +38,7 @@ home: []const u8 = "",
 user: std.ArrayList(Folder) = .empty,
 pinned: std.ArrayList(Folder) = .empty,
 drives: std.ArrayList(Drive) = .empty,
+root_name_buffer: [128]u8 = undefined,
 
 pub fn load(gpa: std.mem.Allocator, io: std.Io) Places {
     var self: Places = .{ .arena = .init(gpa) };
@@ -279,7 +280,64 @@ fn unescapeHex(a: std.mem.Allocator, text: []const u8) ?[]const u8 {
     return out[0..n];
 }
 
+/// What the root's drive is called: "fedora (/)", or "Local Disk (/)".
+pub fn rootName(self: *const Places) []const u8 {
+    for (self.drives.items) |d| if (std.mem.eql(u8, d.mount, "/")) {
+        const n = std.fmt.bufPrint(@constCast(&self.root_name_buffer), "{s} (/)", .{d.label}) catch return "Local Disk (/)";
+        return n;
+    };
+    return "Local Disk (/)";
+}
+
+/// Pin `path` to Quick access: a line of GTK's bookmarks - or, pinned
+/// already, take it off.
+pub fn togglePin(self: *Places, io: std.Io, path: []const u8) void {
+    const a = self.arena.allocator();
+    var config_buffer: [512]u8 = undefined;
+    const file = std.fmt.allocPrint(a, "{s}/gtk-3.0/bookmarks", .{self.configHome(&config_buffer)}) catch return;
+    const was = std.Io.Dir.cwd().readFileAlloc(io, file, a, .limited(64 << 10)) catch "";
+    var out: std.ArrayList(u8) = .empty;
+    var removed = false;
+    var lines = std.mem.tokenizeScalar(u8, was, '\n');
+    while (lines.next()) |line| {
+        const uri_end = std.mem.indexOfScalar(u8, line, ' ') orelse line.len;
+        const uri = line[0..uri_end];
+        const p = if (std.mem.startsWith(u8, uri, "file://")) unescape(a, uri["file://".len..]) orelse "" else "";
+        if (std.mem.eql(u8, p, path)) {
+            removed = true;
+            continue;
+        }
+        out.appendSlice(a, line) catch return;
+        out.append(a, '\n') catch return;
+    }
+    if (!removed) {
+        out.appendSlice(a, "file://") catch return;
+        for (path) |c| {
+            if (std.ascii.isAlphanumeric(c) or c == '/' or c == '-' or c == '_' or c == '.' or c == '~') {
+                out.append(a, c) catch return;
+            } else out.print(a, "%{X:0>2}", .{c}) catch return;
+        }
+        out.append(a, '\n') catch return;
+    }
+    if (std.fs.path.dirname(file)) |dir| std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = out.items }) catch return;
+    // Read again, so the pane and Home show it.
+    self.pinned.clearRetainingCapacity();
+    self.readBookmarks(io);
+}
+
+pub fn isPinned(self: *const Places, path: []const u8) bool {
+    for (self.pinned.items) |f| if (std.mem.eql(u8, f.path, path)) return true;
+    return false;
+}
+
 /// The user folder that `path` is, if it is one.
+/// Where a person's folder is: their Desktop, their Documents.
+pub fn pathOf(self: *const Places, which: Special) ?[]const u8 {
+    for (self.user.items) |f| if (f.special == which) return f.path;
+    return null;
+}
+
 pub fn specialOf(self: *const Places, path: []const u8) ?Special {
     for (self.user.items) |f| if (std.mem.eql(u8, f.path, path)) return f.special;
     return null;

@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: BSD-2-Clause
 
-//! What a tab shows: Home (Windows 10's Quick access), This PC, or a folder
-//! in one of Windows' eight views - Extra large, Large, Medium and Small
-//! icons, List, Details, Tiles, Content.
+//! What a tab shows: Home (Windows 10's Quick access), This PC, or a list -
+//! a folder, a search's findings, the Recycle Bin - in one of Windows'
+//! eight views: Extra large, Large, Medium and Small icons, List, Details,
+//! Tiles, Content; in groups, where it is grouped, each under its heading
+//! and folded by it.
 //!
 //! **Only what is in sight is laid out**: a folder of a hundred thousand
-//! files costs what forty do. The rows above and below are a spacer each,
-//! as tall as they would be.
+//! files costs what forty do. What is above and below is a spacer each,
+//! as tall as it would be.
+//!
+//! A drag from where there is no item draws a rubber band, and what it
+//! touches is chosen; with check boxes on, each item has one to tick.
 
 const std = @import("std");
 
@@ -21,10 +26,10 @@ const Folder = @import("Folder.zig");
 const Places = @import("Places.zig");
 const Window = @import("Window.zig");
 const chrome = @import("chrome.zig");
-const nav = @import("nav.zig");
 const icons = @import("icons.zig");
 const menus = @import("menus.zig");
 const actions = @import("actions.zig");
+const win10 = @import("win10.zig");
 
 const scroll_id = "view/scroll";
 
@@ -44,32 +49,46 @@ pub fn content(self: *Files, kit: *Kit) void {
         .background_color = chrome.contentColor(kit),
     });
     defer u.close();
+    renameDue(self);
     switch (t.location) {
         .home => homePage(self, kit),
         .this_pc => thisPcPage(self, kit),
-        .folder => folderView(self, kit),
+        .folder, .search, .trash => listView(self, kit),
     }
 }
 
-fn scrollbar(kit: *Kit) ui.layout.Scrollbar {
-    return .{ .width = 6, .corner_radius = 3, .thumb_color = kit.theme.palette.text_tertiary, .hide_after_seconds = 1.5 };
-}
-
 fn scrollClip(kit: *Kit) ui.layout.Clip {
-    return .{ .vertical = true, .scroll_y = true, .no_drag_scroll = true, .scrollbar = scrollbar(kit) };
+    return .{
+        .vertical = true,
+        .scroll_y = true,
+        .no_drag_scroll = true,
+        .scrollbar = .{ .width = 6, .corner_radius = if (kit.theme.look.style == .win10) 0 else 3, .thumb_color = kit.theme.palette.text_tertiary, .hide_after_seconds = 1.5 },
+    };
 }
 
 /// The colour an item is drawn on: chosen, under the pointer, or neither.
 fn itemFill(self: *Files, kit: *Kit, selected: bool, hovered: bool) Color {
     const p = &kit.theme.palette;
     if (self.ten()) {
-        if (selected) return nav.win10Selection(kit);
-        if (hovered) return nav.win10Hover(kit);
+        if (selected) return win10.pressColor(kit);
+        if (hovered) return win10.hoverColor(kit);
         return .transparent;
     }
     if (selected) return p.accent.withAlpha(if (p.mode == .dark) 0.32 else 0.18);
     if (hovered) return p.subtle_secondary;
     return .transparent;
+}
+
+/// Windows 10's chosen item has an edge a shade deeper than its fill.
+fn win10Edge(kit: *Kit) Color {
+    return if (kit.theme.palette.mode == .dark) widgets.argb(0xFF999999) else widgets.argb(0xFF99D1FF);
+}
+
+fn itemBorder(self: *Files, kit: *Kit, i: usize, selected: bool, hovered: bool) ui.layout.Border {
+    const t = self.tab();
+    if (self.ten() and (selected or hovered)) return .{ .color = if (selected) win10Edge(kit) else win10.hoverColor(kit), .width = .all(1) };
+    if (t.focus == i and !selected and t.selectedCount() > 0) return .{ .color = kit.theme.palette.focus_outer.withAlpha(0.6), .width = .all(1) };
+    return .{};
 }
 
 /// A name as shown: without its extension when they are hidden.
@@ -131,54 +150,169 @@ fn pressed(self: *Files, i: usize) void {
     const ctrl = w.modifierHeld("Control");
     const shift = w.modifierHeld("Shift");
     if (w.clickCount() >= 2 and !ctrl and !shift) {
+        self.rename_pending = null;
+        if (t.location == .trash) return self.openProperties();
         self.open(i, false);
         return;
+    }
+    // A click on the one chosen: its name to type anew, as Windows has it
+    // - in a moment, unless the click was the first of a double click.
+    if (!ctrl and !shift and t.selectedCount() == 1 and t.selected.items[i] and self.renaming == null and t.location != .trash) {
+        self.rename_pending = i;
+        self.rename_pending_ms = Window.nowMs() + 500;
+        w.wakeAt(self.rename_pending_ms);
     }
     t.click(i, ctrl, shift);
 }
 
+/// A press on item `i`: on its check box, ticked or not, the rest as they
+/// were; elsewhere, a click.
+fn pressedOn(self: *Files, u: *ui.Ui, i: usize) void {
+    var buffer: [32]u8 = undefined;
+    const check = std.fmt.bufPrint(&buffer, "item/{d}/check", .{i}) catch "";
+    if (self.check_boxes and u.isPointerOver(check)) {
+        self.tab().click(i, true, false);
+        return;
+    }
+    pressed(self, i);
+}
+
+/// A name to type anew, asked for by a click on the one chosen, once no
+/// second click made it a double one.
+fn renameDue(self: *Files) void {
+    const i = self.rename_pending orelse return;
+    if (Window.nowMs() < self.rename_pending_ms) return;
+    self.rename_pending = null;
+    const t = self.tab();
+    if (i < t.count() and t.selected.items[i] and t.selectedCount() == 1) self.startRename(i);
+}
+
+/// A check box on the item: what is chosen, ticked or not.
+fn checkBox(self: *Files, kit: *Kit, i: usize, shown: bool) void {
+    const u = kit.ui;
+    const p = &kit.theme.palette;
+    const t = self.tab();
+    const id = kit.print("item/{d}/check", .{i});
+    const on = t.selected.items[i];
+    u.open(.{
+        .id = id,
+        .width = .fixed(16),
+        .height = .fixed(16),
+        .align_x = .center,
+        .align_y = .center,
+        .corner_radius = .all(if (self.ten()) 0 else 3),
+        .background_color = if (!shown) .transparent else if (on) (if (self.ten()) widgets.argb(0xFF1979CA) else p.accent) else chrome.contentColor(kit),
+        .border = if (!shown) .{} else .{ .color = if (on) .transparent else p.control_strong_stroke, .width = .all(1) },
+    });
+    if (shown and on) kit.icon(.checkmark, 12, p.text_on_accent, .regular);
+    u.close();
+}
+
 // -------------------------------------------------------------------------
-// A folder
+// A list: a folder, a search's findings, the Recycle Bin
 // -------------------------------------------------------------------------
 
-fn folderView(self: *Files, kit: *Kit) void {
+/// The columns of Details, for what is shown.
+const Col = enum { name, modified, type, size, folder, original, deleted };
+
+fn columnsOf(t: *const Tab) []const Col {
+    return switch (t.location) {
+        .search => &.{ .name, .modified, .type, .size, .folder },
+        .trash => &.{ .name, .original, .deleted, .size, .type, .modified },
+        else => &.{ .name, .modified, .type, .size },
+    };
+}
+
+fn colName(c: Col) []const u8 {
+    return switch (c) {
+        .name => "Name",
+        .modified => "Date modified",
+        .type => "Type",
+        .size => "Size",
+        .folder => "Folder",
+        .original => "Original Location",
+        .deleted => "Date Deleted",
+    };
+}
+
+fn colWidth(c: Col) ?f32 {
+    return switch (c) {
+        .name => null,
+        .modified, .deleted => 150,
+        .type => 150,
+        .size => 90,
+        .folder, .original => 220,
+    };
+}
+
+/// A column's width: Name takes what is left, never less than a name
+/// needs; the others give way down to about half, as a narrow window
+/// squeezes them.
+fn colSizing(c: Col) ui.layout.Sizing {
+    const w = colWidth(c) orelse return .growWith(.{ .min = 160 });
+    return .fixedDownTo(w, w * 0.55);
+}
+
+fn colSort(c: Col) ?Folder.Column {
+    return switch (c) {
+        .name => .name,
+        .modified => .modified,
+        .type => .type,
+        .size => .size,
+        else => null,
+    };
+}
+
+fn listView(self: *Files, kit: *Kit) void {
     const u = kit.ui;
     const p = &kit.theme.palette;
     const t = self.tab();
     noticeBar(self, kit);
     if (t.view == .details) detailsHeader(self, kit);
+    u.open(.{
+        .id = scroll_id,
+        .width = .grow,
+        .height = .grow,
+        .direction = .top_to_bottom,
+        .padding = .trbl(if (t.view == .details) 0 else 6, if (self.ten()) 0 else 8, 8, if (self.ten()) 0 else 8),
+        .clip = scrollClip(kit),
+    });
+    defer u.close();
     defer if (self.context_at) |at| if (u.isPointerOver(scroll_id)) {
         // On nothing: the folder's own menu, and nothing chosen.
         t.selectNone();
         menus.openAt(self, at, false);
         self.context_at = null;
     };
-    u.open(.{
-        .id = scroll_id,
-        .width = .grow,
-        .height = .grow,
-        .direction = .top_to_bottom,
-        .padding = .trbl(if (t.view == .details) 0 else 8, if (self.ten()) 0 else 8, 8, if (self.ten()) 0 else 8),
-        .clip = scrollClip(kit),
-    });
-    defer u.close();
-    // A press on nothing chooses nothing.
-    if (u.justPressed() and !self.window.modifierHeld("Control") and !overAnItem(self, u)) t.selectNone();
+    // A press on nothing chooses nothing - and starts a rubber band.
+    if (u.justPressed() and !overAnItem(self, u)) {
+        if (!self.window.modifierHeld("Control")) t.selectNone();
+        self.band_from = self.window.pointer_at;
+        self.band_base.clearRetainingCapacity();
+        self.band_base.appendSlice(self.gpa, t.selected.items) catch {};
+    }
     if (t.count() == 0) {
         u.open(.{ .width = .grow, .padding = .all(24), .align_x = .center });
-        kit.label(if (t.folder != null and t.folder.?.failure != null) "This folder could not be read." else "This folder is empty.", .body, p.text_secondary);
+        const empty_text = switch (t.location) {
+            .search => if (self.searching()) "Searching…" else "No items match your search.",
+            else => if (t.folder != null and t.folder.?.failure != null) "This folder could not be read." else "This folder is empty.",
+        };
+        kit.label(empty_text, .caption, p.text_secondary);
         u.close();
         return;
     }
+    const ten = self.ten();
+    const row_h: f32 = if (ten) 22 else if (self.compact) 26 else 32;
     switch (t.view) {
-        .details => rows(self, kit, if (self.ten()) 22 else 32, detailsRow),
-        .content => rows(self, kit, 64, contentRow),
-        .extra_large => grid(self, kit, .{ 232, 264 }, 192),
-        .large => grid(self, kit, .{ 120, 140 }, 96),
-        .medium => grid(self, kit, .{ 96, 96 }, 48),
-        .small, .list => grid(self, kit, .{ 240, if (self.ten()) 22 else 28 }, 16),
-        .tiles => grid(self, kit, .{ 280, 68 }, 48),
+        .details => lines(self, kit, .{ 0, row_h }, false),
+        .content => lines(self, kit, .{ 0, 64 }, false),
+        .extra_large => lines(self, kit, .{ 232, 264 }, true),
+        .large => lines(self, kit, .{ 120, 140 }, true),
+        .medium => lines(self, kit, .{ 96, 96 }, true),
+        .small, .list => lines(self, kit, .{ 240, row_h }, true),
+        .tiles => lines(self, kit, .{ 280, 68 }, true),
     }
+    rubberBand(self, kit);
 }
 
 /// Whether the pointer is on an item - by the last drawing.
@@ -189,11 +323,15 @@ fn overAnItem(self: *Files, u: *ui.Ui) bool {
         const id = std.fmt.bufPrint(&buffer, "item/{d}", .{i}) catch continue;
         if (u.isPointerOver(id)) return true;
     }
+    // A group's heading is something too.
+    for (0..t.groups.items.len) |g| {
+        const id = std.fmt.bufPrint(&buffer, "group/{d}", .{g}) catch continue;
+        if (u.isPointerOver(id)) return true;
+    }
     return false;
 }
 
-/// Where in the scrolled list the view is, in the window's pixels: the
-/// first pixel shown and how many are.
+/// Where in the scrolled list the view is, in the window's pixels.
 fn scrolled(self: *Files, u: *ui.Ui) struct { top: f32, height: f32, width: f32 } {
     const s = self.window.scale;
     const scroll = u.scrollOf(scroll_id) orelse return .{ .top = 0, .height = @floatFromInt(self.window.height), .width = @floatFromInt(self.window.width) };
@@ -204,40 +342,117 @@ fn scrolled(self: *Files, u: *ui.Ui) struct { top: f32, height: f32, width: f32 
     };
 }
 
-/// Scrolled so the item the keyboard moved to is in sight.
-fn reveal(self: *Files, u: *ui.Ui, top_of: f32, height: f32, view: anytype) void {
-    const t = self.tab();
-    if (!t.reveal) return;
-    t.reveal = false;
-    const s = self.window.scale;
-    if (top_of < view.top) {
-        u.scrollTo(scroll_id, 0, top_of * s);
-    } else if (top_of + height > view.top + view.height) {
-        u.scrollTo(scroll_id, 0, (top_of + height - view.height) * s);
-    }
-    self.window.redraw();
-}
+/// What the list is made of, line by line: a group's heading, a row, or a
+/// row of cells.
+const Line = struct { group: ?usize = null, first: usize = 0, end: usize = 0, h: f32 };
 
-/// One item a row, `row_h` high, only those in sight drawn.
-fn rows(self: *Files, kit: *Kit, row_h: f32, comptime drawRow: fn (*Files, *Kit, usize, f32) void) void {
+/// The list drawn as lines - one item each, or `cell` wide cells - in
+/// groups where it is grouped, only the lines in sight.
+fn lines(self: *Files, kit: *Kit, cell: [2]f32, grid: bool) void {
     const u = kit.ui;
     const t = self.tab();
-    self.grid_columns = 1;
     const view = scrolled(self, u);
+    const across: usize = if (grid) @max(1, @as(usize, @intFromFloat(@floor((view.width - 16) / cell[0])))) else 1;
+    self.grid_columns = across;
+    const header_h: f32 = if (self.ten()) 30 else 40;
+
+    // The lines, top to bottom, as the groups have them.
+    var all: std.ArrayList(Line) = .empty;
+    defer all.deinit(self.gpa);
     const n = t.count();
-    const first: usize = @min(n, @as(usize, @intFromFloat(@max(0, @floor(view.top / row_h)))) -| 2);
-    const last: usize = @min(n, first + @as(usize, @intFromFloat(@ceil(view.height / row_h))) + 6);
-    if (t.focus) |f| reveal(self, u, @as(f32, @floatFromInt(f)) * row_h, row_h, view);
-    if (first > 0) u.empty(.{ .width = .grow, .height = .fixed(@as(f32, @floatFromInt(first)) * row_h) });
-    for (first..last) |i| drawRow(self, kit, i, row_h);
-    if (last < n) u.empty(.{ .width = .grow, .height = .fixed(@as(f32, @floatFromInt(n - last)) * row_h) });
+    if (t.groups.items.len == 0) {
+        var i: usize = 0;
+        while (i < n) : (i += across) all.append(self.gpa, .{ .first = i, .end = @min(n, i + across), .h = cell[1] }) catch return;
+    } else for (t.groups.items, 0..) |g, gi| {
+        all.append(self.gpa, .{ .group = gi, .h = header_h }) catch return;
+        if (g.folded) continue;
+        var i = g.first;
+        while (i < g.first + g.count) : (i += across) all.append(self.gpa, .{ .first = i, .end = @min(g.first + g.count, i + across), .h = cell[1] }) catch return;
+    }
+
+    // The keyboard moved: the line it is on brought into sight.
+    if (t.reveal) if (t.focus) |f| {
+        var y: f32 = 0;
+        for (all.items) |l| {
+            if (l.group == null and f >= l.first and f < l.end) {
+                const s = self.window.scale;
+                if (y < view.top) u.scrollTo(scroll_id, 0, y * s) else if (y + l.h > view.top + view.height) u.scrollTo(scroll_id, 0, (y + l.h - view.height) * s);
+                break;
+            }
+            y += l.h;
+        }
+        t.reveal = false;
+        self.window.redraw();
+    };
+
+    var y: f32 = 0;
+    var above: f32 = 0;
+    var below: f32 = 0;
+    for (all.items) |l| {
+        const in_sight = y + l.h >= view.top - 200 and y <= view.top + view.height + 200;
+        if (!in_sight) {
+            if (y < view.top) above += l.h else below += l.h;
+            y += l.h;
+            continue;
+        }
+        if (above > 0) {
+            u.empty(.{ .width = .grow, .height = .fixed(above) });
+            above = 0;
+        }
+        if (l.group) |gi| {
+            groupHeading(self, kit, gi, l.h);
+        } else if (!grid) {
+            for (l.first..l.end) |i| if (t.view == .content) contentRow(self, kit, i, l.h) else detailsRow(self, kit, i, l.h);
+        } else {
+            u.open(.{ .width = .grow, .height = .fixed(l.h) });
+            defer u.close();
+            for (l.first..l.end) |i| switch (t.view) {
+                .tiles => tileCell(self, kit, i, cell),
+                .small, .list => smallCell(self, kit, i, cell),
+                .extra_large => iconCell(self, kit, i, cell, 192),
+                .large => iconCell(self, kit, i, cell, 96),
+                else => iconCell(self, kit, i, cell, 48),
+            };
+        }
+        y += l.h;
+    }
+    if (below > 0) u.empty(.{ .width = .grow, .height = .fixed(below) });
+}
+
+/// A group's heading: its name and how many are in it - Windows 11's with
+/// a chevron, Windows 10's in blue with a line after it. A click folds it.
+fn groupHeading(self: *Files, kit: *Kit, gi: usize, h: f32) void {
+    const u = kit.ui;
+    const p = &kit.theme.palette;
+    const t = self.tab();
+    const g = &t.groups.items[gi];
+    const id = kit.print("group/{d}", .{gi});
+    const hovered = u.isPointerOver(id);
+    const ten = self.ten();
+    u.open(.{
+        .id = id,
+        .width = .grow,
+        .height = .fixed(h),
+        .padding = .trbl(if (ten) 6 else 10, 8, 0, if (ten) 4 else 8),
+        .gap = 8,
+        .align_y = .center,
+        .corner_radius = .all(if (ten) 0 else 4),
+        .background_color = if (hovered) (if (ten) win10.hoverColor(kit) else p.subtle_secondary) else .transparent,
+    });
+    defer u.close();
+    if (!ten) kit.icon(if (g.folded) .chevron_right else .chevron_down, 12, p.text_secondary, .regular);
+    const blue = if (p.mode == .dark) widgets.argb(0xFF6CB4F2) else widgets.argb(0xFF1E3287);
+    var style = kit.style(if (ten) .body else .body_strong, if (ten) blue else p.text_primary);
+    style.wrap = .none;
+    u.text(kit.print("{s} ({d})", .{ g.name(), g.count }), style);
+    if (ten) {
+        u.empty(.{ .width = .grow, .height = .fixed(1), .background_color = if (p.mode == .dark) widgets.argb(0xFF3C3C3C) else widgets.argb(0xFFE2E2E2) });
+        if (hovered) kit.icon(if (g.folded) .chevron_down else .chevron_up, 10, blue, .regular);
+    }
+    if (u.justReleased()) g.folded = !g.folded;
 }
 
 // -- Details --
-
-const date_w = 170;
-const type_w = 170;
-const size_w = 100;
 
 fn detailsHeader(self: *Files, kit: *Kit) void {
     const u = kit.ui;
@@ -247,36 +462,34 @@ fn detailsHeader(self: *Files, kit: *Kit) void {
     u.open(.{
         .id = "details/header",
         .width = .grow,
-        .height = .fixed(if (ten) 24 else 32),
+        .height = .fixed(if (ten) 25 else 32),
         .padding = .trbl(0, if (ten) 0 else 16, 0, if (ten) 0 else 16),
         .align_y = .center,
-        .border = if (ten) .{ .color = p.divider, .width = .{ .bottom = 1 } } else .{},
+        .border = if (ten) .{ .color = win10.edgeColor(kit), .width = .{ .bottom = 1 } } else .{},
     });
     defer u.close();
-    const cols = [_]struct { by: Folder.Column, name: []const u8, width: ?f32 }{
-        .{ .by = .name, .name = "Name", .width = null },
-        .{ .by = .modified, .name = "Date modified", .width = date_w },
-        .{ .by = .type, .name = "Type", .width = type_w },
-        .{ .by = .size, .name = "Size", .width = size_w },
-    };
-    for (cols) |c| {
-        const id = kit.print("details/column/{t}", .{c.by});
+    if (self.check_boxes) u.empty(.{ .width = .fixed(24) });
+    for (columnsOf(t)) |c| {
+        const id = kit.print("details/column/{t}", .{c});
         const hovered = u.isPointerOver(id);
         u.open(.{
             .id = id,
-            .width = if (c.width) |w| .fixed(w) else .grow,
+            .width = colSizing(c),
             .height = .grow,
             .padding = .xy(if (ten) 6 else 8, 0),
             .gap = 4,
             .align_y = .center,
-            .background_color = if (hovered) (if (ten) nav.win10Hover(kit) else p.subtle_secondary) else .transparent,
-            .border = if (ten) .{ .color = p.divider, .width = .{ .right = 1 } } else .{},
+            .align_x = if (c == .size) .right else .left,
+            .background_color = if (hovered) (if (ten) win10.hoverColor(kit) else p.subtle_secondary) else .transparent,
+            .border = if (ten) .{ .color = win10.edgeColor(kit), .width = .{ .right = 1 } } else .{},
+            .clip = .both,
         });
-        var style = kit.style(if (ten) .body else .caption, if (ten) p.text_secondary else p.text_secondary);
+        // Windows 10's headings are a muted blue.
+        var style = kit.style(.caption, if (ten) (if (p.mode == .dark) widgets.argb(0xFFB0B0B0) else widgets.argb(0xFF4C607A)) else p.text_secondary);
         style.wrap = .none;
-        u.text(c.name, style);
-        if (t.sort_by == c.by) kit.icon(if (t.ascending) .chevron_up else .chevron_down, 10, p.text_secondary, .regular);
-        if (u.justReleased()) t.sortBy(c.by, &self.mime, self.show_hidden);
+        u.text(colName(c), style);
+        if (colSort(c)) |s| if (t.sort_by == s) kit.icon(if (t.ascending) .chevron_up else .chevron_down, 8, p.text_secondary, .regular);
+        if (u.justReleased()) if (colSort(c)) |s| self.sortBy(s);
         u.close();
     }
 }
@@ -298,50 +511,48 @@ fn detailsRow(self: *Files, kit: *Kit, i: usize, row_h: f32) void {
         .align_y = .center,
         .corner_radius = .all(if (ten) 0 else 4),
         .background_color = itemFill(self, kit, selected, hovered),
-        .border = if (ten and selected) .{ .color = win10Edge(kit), .width = .all(1) } else if (t.focus == i and !selected) .{ .color = p.focus_outer.withAlpha(0.5), .width = .all(1) } else .{},
+        .border = itemBorder(self, kit, i, selected, hovered),
     });
     defer u.close();
-    if (u.justPressed()) pressed(self, i);
-    requests(self, u, id, i);
-    const faded = e.hidden;
-    const ink = if (faded) p.text_secondary else p.text_primary;
-    {
-        u.open(.{ .width = .grow, .height = .grow, .padding = .xy(if (ten) 6 else 8, 0), .gap = 8, .align_y = .center, .clip = .both });
-        defer u.close();
-        u.open(.{ .width = .fixed(16), .height = .fixed(16), .opacity = if (faded) 0.55 else 1 });
-        icons.forEntry(self, kit, t.path().?, e, 16);
+    if (self.check_boxes) {
+        u.open(.{ .width = .fixed(24), .align_x = .center });
+        checkBox(self, kit, i, hovered or selected);
         u.close();
-        var style = kit.style(.body, ink);
-        style.wrap = .none;
-        nameOrField(self, kit, i, e, style);
     }
-    var secondary = kit.style(.body, p.text_secondary);
+    if (u.justPressed()) pressedOn(self, u, i);
+    requests(self, u, id, i);
+    const ink = if (e.hidden) p.text_secondary else p.text_primary;
+    var secondary = kit.style(.caption, p.text_secondary);
     secondary.wrap = .none;
-    {
-        u.open(.{ .width = .fixed(date_w), .padding = .xy(8, 0), .clip = .both });
-        defer u.close();
-        var date_buffer: [32]u8 = undefined;
-        u.text(kit.print("{s}", .{dateText(e.mtime, &date_buffer)}), secondary);
-    }
-    {
-        u.open(.{ .width = .fixed(type_w), .padding = .xy(8, 0), .clip = .both });
-        defer u.close();
-        var type_buffer: [64]u8 = undefined;
-        u.text(kit.print("{s}", .{self.mime.describe(e.mime, e.name, &type_buffer)}), secondary);
-    }
-    {
-        u.open(.{ .width = .fixed(size_w), .padding = .xy(8, 0), .align_x = .right, .clip = .both });
-        defer u.close();
-        if (!e.isFolder()) {
-            var size_buffer: [32]u8 = undefined;
-            u.text(kit.print("{s}", .{detailsSize(e.size, &size_buffer)}), secondary);
+    for (columnsOf(t)) |c| {
+        if (c == .name) {
+            u.open(.{ .width = colSizing(c), .height = .grow, .padding = .xy(if (ten) 6 else 8, 0), .gap = 8, .align_y = .center, .clip = .both });
+            defer u.close();
+            u.open(.{ .width = .fixed(16), .height = .fixed(16), .opacity = if (e.hidden) 0.55 else 1 });
+            icons.forEntry(self, kit, t.dirOf(e) orelse "/", e, 16);
+            u.close();
+            var style = kit.style(.caption, ink);
+            style.wrap = .none;
+            nameOrField(self, kit, i, e, style);
+            continue;
         }
+        u.open(.{ .width = colSizing(c), .padding = .xy(8, 0), .align_x = if (c == .size) .right else .left, .clip = .both });
+        defer u.close();
+        var buffer: [256]u8 = undefined;
+        u.text(kit.print("{s}", .{cellText(self, e, c, &buffer)}), secondary);
     }
 }
 
-/// Windows 10's chosen row has an edge a shade deeper than its fill.
-fn win10Edge(kit: *Kit) Color {
-    return if (kit.theme.palette.mode == .dark) widgets.argb(0xFF999999) else widgets.argb(0xFF99D1FF);
+/// What a column says of an entry.
+fn cellText(self: *Files, e: *const Folder.Entry, c: Col, buffer: []u8) []const u8 {
+    return switch (c) {
+        .name => e.name,
+        .modified => dateText(e.mtime, buffer),
+        .deleted => dateText(e.deleted, buffer),
+        .type => self.mime.describe(e.mime, e.name, buffer),
+        .size => if (e.isFolder()) "" else detailsSize(e.size, buffer),
+        .folder, .original => e.dir orelse "",
+    };
 }
 
 /// The Size column as Windows' Details has it: whole kilobytes, rounded up.
@@ -407,6 +618,7 @@ fn contentRow(self: *Files, kit: *Kit, i: usize, row_h: f32) void {
     const e = t.entry(i);
     const id = kit.print("item/{d}", .{i});
     const selected = t.selected.items[i];
+    const hovered = u.isPointerOver(id);
     u.open(.{
         .id = id,
         .width = .grow,
@@ -415,17 +627,18 @@ fn contentRow(self: *Files, kit: *Kit, i: usize, row_h: f32) void {
         .gap = 12,
         .align_y = .center,
         .corner_radius = .all(if (self.ten()) 0 else 4),
-        .background_color = itemFill(self, kit, selected, u.isPointerOver(id)),
-        .border = .{ .color = p.divider, .width = .{ .bottom = 1 } },
+        .background_color = itemFill(self, kit, selected, hovered),
+        .border = if (self.ten() and selected) itemBorder(self, kit, i, selected, hovered) else .{ .color = kit.theme.palette.divider, .width = .{ .bottom = 1 } },
     });
     defer u.close();
-    if (u.justPressed()) pressed(self, i);
+    if (self.check_boxes) checkBox(self, kit, i, hovered or selected);
+    if (u.justPressed()) pressedOn(self, u, i);
     requests(self, u, id, i);
-    icons.forEntry(self, kit, t.path().?, e, 32);
+    icons.forEntry(self, kit, t.dirOf(e) orelse "/", e, 32);
     {
         u.open(.{ .width = .grow, .direction = .top_to_bottom, .gap = 2, .clip = .both });
         defer u.close();
-        var style = kit.style(.body, p.text_primary);
+        var style = kit.style(.caption, p.text_primary);
         style.wrap = .none;
         nameOrField(self, kit, i, e, style);
         var type_buffer: [64]u8 = undefined;
@@ -449,31 +662,6 @@ fn contentRow(self: *Files, kit: *Kit, i: usize, row_h: f32) void {
 
 // -- The icon views, and Tiles --
 
-/// Items in cells `cell` big, as many to a row as fit, an icon `icon`
-/// across in each - only the rows in sight drawn.
-fn grid(self: *Files, kit: *Kit, cell: [2]f32, icon: u16) void {
-    const u = kit.ui;
-    const t = self.tab();
-    const view = scrolled(self, u);
-    const room = view.width - 16;
-    const across: usize = @max(1, @as(usize, @intFromFloat(@floor(room / cell[0]))));
-    self.grid_columns = across;
-    const n = t.count();
-    const total_rows = (n + across - 1) / across;
-    const first_row: usize = @as(usize, @intFromFloat(@max(0, @floor(view.top / cell[1])))) -| 1;
-    const last_row: usize = @min(total_rows, first_row + @as(usize, @intFromFloat(@ceil(view.height / cell[1]))) + 3);
-    if (t.focus) |f| reveal(self, u, @as(f32, @floatFromInt(f / across)) * cell[1], cell[1], view);
-    if (first_row > 0) u.empty(.{ .width = .grow, .height = .fixed(@as(f32, @floatFromInt(first_row)) * cell[1]) });
-    for (first_row..last_row) |r| {
-        u.open(.{ .width = .grow, .height = .fixed(cell[1]) });
-        defer u.close();
-        for (r * across..@min(n, (r + 1) * across)) |i| {
-            if (t.view == .tiles) tileCell(self, kit, i, cell) else if (icon <= 16) smallCell(self, kit, i, cell) else iconCell(self, kit, i, cell, icon);
-        }
-    }
-    if (last_row < total_rows) u.empty(.{ .width = .grow, .height = .fixed(@as(f32, @floatFromInt(total_rows - last_row)) * cell[1]) });
-}
-
 fn iconCell(self: *Files, kit: *Kit, i: usize, cell: [2]f32, icon: u16) void {
     const u = kit.ui;
     const p = &kit.theme.palette;
@@ -481,6 +669,7 @@ fn iconCell(self: *Files, kit: *Kit, i: usize, cell: [2]f32, icon: u16) void {
     const e = t.entry(i);
     const id = kit.print("item/{d}", .{i});
     const selected = t.selected.items[i];
+    const hovered = u.isPointerOver(id);
     u.open(.{
         .id = id,
         .width = .fixed(cell[0] - 4),
@@ -490,21 +679,51 @@ fn iconCell(self: *Files, kit: *Kit, i: usize, cell: [2]f32, icon: u16) void {
         .gap = 4,
         .align_x = .center,
         .corner_radius = .all(if (self.ten()) 0 else 4),
-        .background_color = itemFill(self, kit, selected, u.isPointerOver(id)),
-        .border = if (self.ten() and selected) .{ .color = win10Edge(kit), .width = .all(1) } else .{},
+        .background_color = itemFill(self, kit, selected, hovered),
+        .border = itemBorder(self, kit, i, selected, hovered),
     });
     defer u.close();
-    if (u.justPressed()) pressed(self, i);
+    if (u.justPressed()) pressedOn(self, u, i);
     requests(self, u, id, i);
+    if (self.check_boxes) {
+        u.open(.{ .floating = .{ .attach = .parent, .offset = .{ .x = 4, .y = 4 }, .z_index = 2, .clip = .like_children } });
+        checkBox(self, kit, i, hovered or selected);
+        u.close();
+    }
     u.open(.{ .width = .grow, .height = .fixed(@floatFromInt(icon)), .align_x = .center, .align_y = .bottom });
-    icons.forEntry(self, kit, t.path().?, e, icon);
+    // A picture as itself, made small, in the large views.
+    if (!thumbnail(self, kit, i, icon)) icons.forEntry(self, kit, t.dirOf(e) orelse "/", e, icon);
     u.close();
-    var style = kit.style(.body, p.text_primary);
+    var style = kit.style(.caption, p.text_primary);
     style.alignment = .center;
     style.wrap = .words;
     u.open(.{ .width = .grow, .height = .grow, .clip = .both, .align_x = .center });
     nameOrField(self, kit, i, e, style);
     u.close();
+}
+
+/// A picture's own thumbnail where the system's cache has one: the
+/// freedesktop thumbnail spec's, made by any app that showed it.
+fn thumbnail(self: *Files, kit: *Kit, i: usize, size: u16) bool {
+    if (size < 48) return false;
+    const t = self.tab();
+    const e = t.entry(i);
+    if (!std.mem.startsWith(u8, e.mime, "image/") and !std.mem.startsWith(u8, e.mime, "video/")) return false;
+    const dir = t.dirOf(e) orelse return false;
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const full = std.fmt.bufPrint(&buffer, "{s}/{s}", .{ if (std.mem.eql(u8, dir, "/")) "" else dir, e.name }) catch return false;
+    const s = self.window.scale;
+    const box: u32 = @intFromFloat(@round(@as(f32, @floatFromInt(size)) * s));
+    const made = self.gallery.picture(full, box) orelse return false;
+    kit.ui.empty(.{
+        .width = .fixed(@as(f32, @floatFromInt(made.size[0])) / s),
+        .height = .fixed(@as(f32, @floatFromInt(made.size[1])) / s),
+        .image = .{ .texture = made.slot },
+        // Windows 10 frames a photo with a thin line; 11 rounds it.
+        .border = if (self.ten()) .{ .color = kit.theme.palette.divider, .width = .all(1) } else .{},
+        .corner_radius = .all(if (self.ten()) 0 else 4),
+    });
+    return true;
 }
 
 fn smallCell(self: *Files, kit: *Kit, i: usize, cell: [2]f32) void {
@@ -514,6 +733,7 @@ fn smallCell(self: *Files, kit: *Kit, i: usize, cell: [2]f32) void {
     const e = t.entry(i);
     const id = kit.print("item/{d}", .{i});
     const selected = t.selected.items[i];
+    const hovered = u.isPointerOver(id);
     u.open(.{
         .id = id,
         .width = .fixed(cell[0] - 4),
@@ -522,15 +742,16 @@ fn smallCell(self: *Files, kit: *Kit, i: usize, cell: [2]f32) void {
         .gap = 8,
         .align_y = .center,
         .corner_radius = .all(if (self.ten()) 0 else 4),
-        .background_color = itemFill(self, kit, selected, u.isPointerOver(id)),
-        .border = if (self.ten() and selected) .{ .color = win10Edge(kit), .width = .all(1) } else .{},
+        .background_color = itemFill(self, kit, selected, hovered),
+        .border = itemBorder(self, kit, i, selected, hovered),
         .clip = .both,
     });
     defer u.close();
-    if (u.justPressed()) pressed(self, i);
+    if (self.check_boxes) checkBox(self, kit, i, hovered or selected);
+    if (u.justPressed()) pressedOn(self, u, i);
     requests(self, u, id, i);
-    icons.forEntry(self, kit, t.path().?, e, 16);
-    var style = kit.style(.body, p.text_primary);
+    icons.forEntry(self, kit, t.dirOf(e) orelse "/", e, 16);
+    var style = kit.style(.caption, p.text_primary);
     style.wrap = .none;
     nameOrField(self, kit, i, e, style);
 }
@@ -542,6 +763,7 @@ fn tileCell(self: *Files, kit: *Kit, i: usize, cell: [2]f32) void {
     const e = t.entry(i);
     const id = kit.print("item/{d}", .{i});
     const selected = t.selected.items[i];
+    const hovered = u.isPointerOver(id);
     u.open(.{
         .id = id,
         .width = .fixed(cell[0] - 6),
@@ -550,17 +772,18 @@ fn tileCell(self: *Files, kit: *Kit, i: usize, cell: [2]f32) void {
         .gap = 10,
         .align_y = .center,
         .corner_radius = .all(if (self.ten()) 0 else 4),
-        .background_color = itemFill(self, kit, selected, u.isPointerOver(id)),
-        .border = if (self.ten() and selected) .{ .color = win10Edge(kit), .width = .all(1) } else .{},
+        .background_color = itemFill(self, kit, selected, hovered),
+        .border = itemBorder(self, kit, i, selected, hovered),
         .clip = .both,
     });
     defer u.close();
-    if (u.justPressed()) pressed(self, i);
+    if (self.check_boxes) checkBox(self, kit, i, hovered or selected);
+    if (u.justPressed()) pressedOn(self, u, i);
     requests(self, u, id, i);
-    icons.forEntry(self, kit, t.path().?, e, 48);
+    if (!thumbnail(self, kit, i, 48)) icons.forEntry(self, kit, t.dirOf(e) orelse "/", e, 48);
     u.open(.{ .width = .grow, .direction = .top_to_bottom, .gap = 1, .clip = .both });
     defer u.close();
-    var style = kit.style(.body, p.text_primary);
+    var style = kit.style(.caption, p.text_primary);
     style.wrap = .none;
     nameOrField(self, kit, i, e, style);
     var small = kit.style(.caption, p.text_secondary);
@@ -572,6 +795,56 @@ fn tileCell(self: *Files, kit: *Kit, i: usize, cell: [2]f32) void {
         u.text(kit.print("{s}", .{Folder.sizeText(e.size, &size_buffer)}), small);
     }
 }
+
+// -------------------------------------------------------------------------
+// The rubber band
+// -------------------------------------------------------------------------
+
+/// Dragged from where there was no item: everything it touches chosen -
+/// added to what was, with Ctrl - and the band drawn over the list.
+fn rubberBand(self: *Files, kit: *Kit) void {
+    const from = self.band_from orelse return;
+    const u = kit.ui;
+    const p = &kit.theme.palette;
+    const t = self.tab();
+    if (!self.window.down) {
+        self.band_from = null;
+        return;
+    }
+    const at = self.window.pointer_at orelse return;
+    const x0 = @min(from[0], at[0]);
+    const y0 = @min(from[1], at[1]);
+    const x1 = @max(from[0], at[0]);
+    const y1 = @max(from[1], at[1]);
+    // A drag of a few pixels is still a click.
+    if (x1 - x0 < 4 and y1 - y0 < 4) return;
+    var buffer: [32]u8 = undefined;
+    for (0..t.count()) |i| {
+        const base = if (i < self.band_base.items.len) self.band_base.items[i] else false;
+        const id = std.fmt.bufPrint(&buffer, "item/{d}", .{i}) catch continue;
+        const box = self.window.boxOf(id) orelse {
+            t.selected.items[i] = base;
+            continue;
+        };
+        const touches = box.x < x1 and box.x + box.width > x0 and box.y < y1 and box.y + box.height > y0;
+        t.selected.items[i] = base or touches;
+    }
+    const ten = self.ten();
+    const edge = if (ten) widgets.argb(0xFF3399FF) else p.accent;
+    u.empty(.{
+        .width = .fixed(x1 - x0),
+        .height = .fixed(y1 - y0),
+        .background_color = edge.withAlpha(0.25),
+        .border = .{ .color = edge, .width = .all(1) },
+        .corner_radius = .all(if (ten) 0 else 2),
+        .floating = .{ .attach = .root, .offset = .{ .x = x0, .y = y0 }, .z_index = 40 },
+        .passthrough = true,
+    });
+}
+
+// -------------------------------------------------------------------------
+// What went wrong
+// -------------------------------------------------------------------------
 
 /// What went wrong last, across the top of the folder, until closed.
 fn noticeBar(self: *Files, kit: *Kit) void {
@@ -590,7 +863,7 @@ fn noticeBar(self: *Files, kit: *Kit) void {
     defer u.close();
     kit.icon(.error_circle, 16, p.critical, .filled);
     u.open(.{ .width = .grow });
-    var style = kit.style(.body, p.text_primary);
+    var style = kit.style(.caption, p.text_primary);
     style.wrap = .words;
     u.text(text, style);
     u.close();
@@ -601,40 +874,52 @@ fn noticeBar(self: *Files, kit: *Kit) void {
 // Home, and This PC
 // -------------------------------------------------------------------------
 
-fn section(kit: *Kit, title: []const u8) void {
+/// A section's heading, as a group's: Windows 11's with a chevron,
+/// Windows 10's blue with a line after it.
+fn section(self: *Files, kit: *Kit, title: []const u8) void {
     const u = kit.ui;
-    u.open(.{ .width = .grow, .padding = .trbl(16, 8, 8, 8), .gap = 8, .align_y = .center });
+    const p = &kit.theme.palette;
+    const ten = self.ten();
+    u.open(.{ .width = .grow, .padding = .trbl(if (ten) 10 else 16, 8, if (ten) 6 else 8, 8), .gap = 8, .align_y = .center });
     defer u.close();
-    kit.icon(.chevron_down, 12, kit.theme.palette.text_secondary, .regular);
-    kit.label(title, .body_strong, kit.theme.palette.text_primary);
+    if (!ten) kit.icon(.chevron_down, 12, p.text_secondary, .regular);
+    const blue = if (p.mode == .dark) widgets.argb(0xFF6CB4F2) else widgets.argb(0xFF1E3287);
+    var style = kit.style(if (ten) .body else .body_strong, if (ten) blue else p.text_primary);
+    style.wrap = .none;
+    u.text(title, style);
+    if (ten) u.empty(.{ .width = .grow, .height = .fixed(1), .background_color = if (p.mode == .dark) widgets.argb(0xFF3C3C3C) else widgets.argb(0xFFE2E2E2) });
 }
 
 /// A place as a tile: its icon, its name, and a line under it.
 fn placeTile(self: *Files, kit: *Kit, id: []const u8, icon_name: []const u8, name: []const u8, line: []const u8, pinned: bool) bool {
     const u = kit.ui;
     const p = &kit.theme.palette;
+    const ten = self.ten();
     const lit = self.page_chosen != null and std.mem.eql(u8, self.page_chosen_buffer[0..self.page_chosen_len], id);
+    const hovered = u.isPointerOver(id);
     u.open(.{
         .id = id,
-        .width = .fixed(260),
-        .height = .fixed(64),
+        .width = .fixed(if (ten) 250 else 260),
+        .height = .fixed(if (ten) 56 else 64),
         .padding = .xy(10, 0),
         .gap = 12,
         .align_y = .center,
-        .corner_radius = .all(if (self.ten()) 0 else 4),
-        .background_color = itemFill(self, kit, lit, u.isPointerOver(id)),
+        .corner_radius = .all(if (ten) 0 else 4),
+        .background_color = itemFill(self, kit, lit, hovered),
+        .border = if (ten and (lit or hovered)) .{ .color = if (lit) win10Edge(kit) else win10.hoverColor(kit), .width = .all(1) } else .{},
     });
     defer u.close();
-    icons.themed(self, kit, icon_name, 32);
+    icons.themed(self, kit, icon_name, if (ten) 48 else 32);
     u.open(.{ .width = .grow, .direction = .top_to_bottom, .gap = 2, .clip = .both });
-    var style = kit.style(.body, p.text_primary);
+    var style = kit.style(.caption, p.text_primary);
     style.wrap = .none;
     u.text(name, style);
     var small = kit.style(.caption, p.text_secondary);
     small.wrap = .none;
     u.text(line, small);
+    if (ten and pinned) kit.icon(.pin, 10, p.text_secondary, .regular);
     u.close();
-    if (pinned and !self.ten()) kit.icon(.pin, 12, p.text_secondary, .regular);
+    if (pinned and !ten) kit.icon(.pin, 12, p.text_secondary, .regular);
     // A click chooses it, a double click goes there.
     if (u.justPressed()) {
         if (self.window.clickCount() >= 2) return true;
@@ -645,29 +930,28 @@ fn placeTile(self: *Files, kit: *Kit, id: []const u8, icon_name: []const u8, nam
 
 fn homePage(self: *Files, kit: *Kit) void {
     const u = kit.ui;
-    const p = &kit.theme.palette;
     u.open(.{ .id = scroll_id, .width = .grow, .height = .grow, .direction = .top_to_bottom, .padding = .xy(12, 4), .clip = scrollClip(kit) });
     defer u.close();
     var to: ?[]const u8 = null;
     var to_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    section(kit, if (self.ten()) "Frequent folders" else "Quick access");
+    const frequent = self.places.user.items.len + self.places.pinned.items.len;
+    if (self.ten()) section(self, kit, kit.print("Frequent folders ({d})", .{frequent})) else section(self, kit, "Quick access");
     {
         u.open(.{ .width = .grow, .wrap = true, .gap = 4, .wrap_gap = 4, .padding = .xy(8, 0) });
         defer u.close();
         for (self.places.user.items, 0..) |f, i| {
-            if (placeTile(self, kit, kit.print("home/user/{d}", .{i}), icons.special(f.special), f.name, "Stored locally", true)) to = std.fmt.bufPrint(&to_buffer, "{s}", .{f.path}) catch null;
+            if (placeTile(self, kit, kit.print("home/user/{d}", .{i}), icons.special(f.special), f.name, if (self.ten()) "This PC" else "Stored locally", true)) to = std.fmt.bufPrint(&to_buffer, "{s}", .{f.path}) catch null;
         }
         for (self.places.pinned.items, 0..) |f, i| {
-            if (placeTile(self, kit, kit.print("home/pin/{d}", .{i}), "folder", f.name, f.path, true)) to = std.fmt.bufPrint(&to_buffer, "{s}", .{f.path}) catch null;
+            if (placeTile(self, kit, kit.print("home/pin/{d}", .{i}), "folder", f.name, std.fs.path.dirname(f.path) orelse "/", true)) to = std.fmt.bufPrint(&to_buffer, "{s}", .{f.path}) catch null;
         }
     }
     if (!self.ten()) {
-        section(kit, "Favorites");
+        section(self, kit, "Favorites");
         emptyNote(kit, "After you've favorited some files, we'll show them here.");
     }
-    section(kit, if (self.ten()) "Recent files" else "Recent");
+    section(self, kit, if (self.ten()) "Recent files (0)" else "Recent");
     emptyNote(kit, "After you've opened some files, we'll show the most recent ones here.");
-    _ = p;
     if (to) |path| self.goTo(.{ .folder = path });
 }
 
@@ -675,7 +959,7 @@ fn emptyNote(kit: *Kit, text: []const u8) void {
     const u = kit.ui;
     u.open(.{ .width = .grow, .padding = .trbl(4, 16, 8, 32) });
     defer u.close();
-    kit.label(text, .body, kit.theme.palette.text_secondary);
+    kit.label(text, .caption, kit.theme.palette.text_secondary);
 }
 
 fn thisPcPage(self: *Files, kit: *Kit) void {
@@ -687,14 +971,14 @@ fn thisPcPage(self: *Files, kit: *Kit) void {
     // Windows 10's This PC has the folders first; Windows 11's leaves them
     // to Home.
     if (self.ten()) {
-        section(kit, kit.print("Folders ({d})", .{self.places.user.items.len}));
+        section(self, kit, kit.print("Folders ({d})", .{self.places.user.items.len}));
         u.open(.{ .width = .grow, .wrap = true, .gap = 4, .wrap_gap = 4, .padding = .xy(8, 0) });
         for (self.places.user.items, 0..) |f, i| {
             if (placeTile(self, kit, kit.print("pc/user/{d}", .{i}), icons.special(f.special), f.name, "", false)) to = std.fmt.bufPrint(&to_buffer, "{s}", .{f.path}) catch null;
         }
         u.close();
     }
-    section(kit, kit.print("Devices and drives ({d})", .{self.places.drives.items.len}));
+    section(self, kit, kit.print("Devices and drives ({d})", .{self.places.drives.items.len}));
     u.open(.{ .width = .grow, .wrap = true, .gap = 4, .wrap_gap = 4, .padding = .xy(8, 0) });
     for (self.places.drives.items, 0..) |d, i| {
         if (driveTile(self, kit, kit.print("pc/drive/{d}", .{i}), d)) to = std.fmt.bufPrint(&to_buffer, "{s}", .{d.mount}) catch null;
@@ -708,27 +992,32 @@ fn thisPcPage(self: *Files, kit: *Kit) void {
 fn driveTile(self: *Files, kit: *Kit, id: []const u8, d: Places.Drive) bool {
     const u = kit.ui;
     const p = &kit.theme.palette;
+    const ten = self.ten();
     const lit = self.page_chosen != null and std.mem.eql(u8, self.page_chosen_buffer[0..self.page_chosen_len], id);
+    const hovered = u.isPointerOver(id);
     u.open(.{
         .id = id,
         .width = .fixed(300),
-        .height = .fixed(72),
+        .height = .fixed(if (ten) 64 else 72),
         .padding = .xy(10, 0),
         .gap = 12,
         .align_y = .center,
-        .corner_radius = .all(if (self.ten()) 0 else 4),
-        .background_color = itemFill(self, kit, lit, u.isPointerOver(id)),
+        .corner_radius = .all(if (ten) 0 else 4),
+        .background_color = itemFill(self, kit, lit, hovered),
+        .border = if (ten and (lit or hovered)) .{ .color = if (lit) win10Edge(kit) else win10.hoverColor(kit), .width = .all(1) } else .{},
     });
     defer u.close();
     icons.themed(self, kit, if (d.removable) "drive-removable-media" else "drive-harddisk", 48);
     u.open(.{ .width = .grow, .direction = .top_to_bottom, .gap = 4, .clip = .both });
     defer u.close();
-    var style = kit.style(.body, p.text_primary);
+    var style = kit.style(.caption, p.text_primary);
     style.wrap = .none;
     u.text(kit.print("{s} ({s})", .{ d.label, d.mount }), style);
     const used: f32 = if (d.size > 0) @as(f32, @floatFromInt(d.size - d.free)) / @as(f32, @floatFromInt(d.size)) else 0;
-    u.open(.{ .width = .grow, .height = .fixed(if (self.ten()) 14 else 6), .corner_radius = .all(if (self.ten()) 0 else 3), .background_color = p.control_alt_secondary, .border = if (self.ten()) .{ .color = p.divider, .width = .all(1) } else .{} });
-    u.empty(.{ .width = .percent(used), .height = .grow, .corner_radius = .all(if (self.ten()) 0 else 3), .background_color = if (used > 0.9) p.critical else if (self.ten()) widgets.argb(0xFF26A0DA) else p.accent });
+    // Windows 10's bar is a framed light grey, filled blue; Windows 11's a
+    // thin rounded one in the accent.
+    u.open(.{ .width = .grow, .height = .fixed(if (ten) 14 else 6), .corner_radius = .all(if (ten) 0 else 3), .background_color = if (ten) (if (p.mode == .dark) widgets.argb(0xFF3C3C3C) else widgets.argb(0xFFE6E6E6)) else p.control_alt_secondary, .border = if (ten) .{ .color = if (p.mode == .dark) widgets.argb(0xFF5A5A5A) else widgets.argb(0xFFBCBCBC), .width = .all(1) } else .{} });
+    u.empty(.{ .width = .percent(used), .height = .grow, .corner_radius = .all(if (ten) 0 else 3), .background_color = if (used > 0.9) (if (ten) widgets.argb(0xFFDA2626) else p.critical) else if (ten) widgets.argb(0xFF26A0DA) else p.accent });
     u.close();
     var free_buffer: [32]u8 = undefined;
     var size_buffer: [32]u8 = undefined;

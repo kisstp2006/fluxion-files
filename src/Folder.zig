@@ -25,6 +25,12 @@ pub const Entry = struct {
     /// "Hidden items" on.
     hidden: bool = false,
     executable: bool = false,
+    /// Where it is, for an entry not of one folder: a search's finding, or -
+    /// in the Recycle Bin - where it was.
+    dir: ?[]const u8 = null,
+    /// In the Recycle Bin: its name there, and when it went in.
+    stored: ?[]const u8 = null,
+    deleted: i128 = 0,
 
     pub fn isFolder(self: Entry) bool {
         return self.kind == .folder;
@@ -32,6 +38,134 @@ pub const Entry = struct {
 };
 
 pub const Column = enum { name, modified, type, size };
+
+/// An empty folder - for what is filled in by other means: a search, the
+/// Recycle Bin.
+pub fn empty(gpa: std.mem.Allocator, label: []const u8) Folder {
+    var self: Folder = .{ .arena = .init(gpa), .path = "" };
+    self.path = self.arena.allocator().dupe(u8, label) catch label;
+    return self;
+}
+
+/// One entry more: a search's finding at `full`.
+pub fn addFound(self: *Folder, io: std.Io, mime: *const Mime, full: []const u8) void {
+    const a = self.arena.allocator();
+    const dir = std.fs.path.dirname(full) orelse "/";
+    const name = std.fs.path.basename(full);
+    var entry: Entry = .{ .name = a.dupe(u8, name) catch return, .kind = .other, .dir = a.dupe(u8, dir) catch return };
+    entry.hidden = name.len > 0 and name[0] == '.';
+    if (std.Io.Dir.cwd().statFile(io, full, .{})) |stat| {
+        entry.kind = switch (stat.kind) {
+            .directory => .folder,
+            .file => .file,
+            else => .other,
+        };
+        entry.size = stat.size;
+        entry.mtime = stat.mtime.nanoseconds;
+    } else |_| {}
+    entry.mime = if (entry.kind == .folder) Mime.directory else mime.byName(name) orelse Mime.unknown;
+    self.entries.append(a, entry) catch {};
+}
+
+/// The Recycle Bin: each file in `trash/files` with what its `.trashinfo`
+/// says - where it was, when it went.
+pub fn readTrash(gpa: std.mem.Allocator, io: std.Io, mime: *const Mime, trash: []const u8) Folder {
+    var self = empty(gpa, "Recycle Bin");
+    const a = self.arena.allocator();
+    var info_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const info_path = std.fmt.bufPrint(&info_buffer, "{s}/info", .{trash}) catch return self;
+    var info_dir = std.Io.Dir.cwd().openDir(io, info_path, .{ .iterate = true }) catch return self;
+    defer info_dir.close(io);
+    var it = info_dir.iterate();
+    while (it.next(io) catch null) |item| {
+        if (!std.mem.endsWith(u8, item.name, ".trashinfo")) continue;
+        var text_buffer: [8192]u8 = undefined;
+        const text = info_dir.readFile(io, item.name, &text_buffer) catch continue;
+        const original = trashKey(text, "Path=") orelse continue;
+        const decoded = percentDecode(a, original) orelse continue;
+        const stored = a.dupe(u8, item.name[0 .. item.name.len - ".trashinfo".len]) catch continue;
+        const name = std.fs.path.basename(decoded);
+        var entry: Entry = .{
+            .name = name,
+            .kind = .other,
+            .dir = std.fs.path.dirname(decoded) orelse "/",
+            .stored = stored,
+            .deleted = deletionDate(trashKey(text, "DeletionDate=") orelse ""),
+        };
+        var file_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const file = std.fmt.bufPrint(&file_buffer, "{s}/files/{s}", .{ trash, stored }) catch continue;
+        if (std.Io.Dir.cwd().statFile(io, file, .{ .follow_symlinks = false })) |stat| {
+            entry.kind = switch (stat.kind) {
+                .directory => .folder,
+                .file => .file,
+                else => .other,
+            };
+            entry.size = stat.size;
+            entry.mtime = stat.mtime.nanoseconds;
+        } else |_| continue;
+        entry.mime = if (entry.kind == .folder) Mime.directory else mime.byName(name) orelse Mime.unknown;
+        self.entries.append(a, entry) catch {};
+    }
+    return self;
+}
+
+fn trashKey(text: []const u8, key: []const u8) ?[]const u8 {
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const l = std.mem.trimEnd(u8, line, "\r");
+        if (std.mem.startsWith(u8, l, key)) return l[key.len..];
+    }
+    return null;
+}
+
+fn percentDecode(a: std.mem.Allocator, text: []const u8) ?[]const u8 {
+    var out = a.alloc(u8, text.len) catch return null;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        if (text[i] == '%' and i + 3 <= text.len) {
+            if (std.fmt.parseInt(u8, text[i + 1 .. i + 3], 16)) |byte| {
+                out[n] = byte;
+                n += 1;
+                i += 2;
+                continue;
+            } else |_| {}
+        }
+        out[n] = text[i];
+        n += 1;
+    }
+    return out[0..n];
+}
+
+/// `2026-10-09T20:40:00`, local time, as nanoseconds since the epoch.
+fn deletionDate(text: []const u8) i128 {
+    if (text.len < 19) return 0;
+    var tm: Tm = std.mem.zeroes(Tm);
+    tm.year = (std.fmt.parseInt(c_int, text[0..4], 10) catch return 0) - 1900;
+    tm.mon = (std.fmt.parseInt(c_int, text[5..7], 10) catch return 0) - 1;
+    tm.mday = std.fmt.parseInt(c_int, text[8..10], 10) catch return 0;
+    tm.hour = std.fmt.parseInt(c_int, text[11..13], 10) catch return 0;
+    tm.min = std.fmt.parseInt(c_int, text[14..16], 10) catch return 0;
+    tm.sec = std.fmt.parseInt(c_int, text[17..19], 10) catch return 0;
+    tm.isdst = -1;
+    const t = mktime(&tm);
+    return @as(i128, t) * std.time.ns_per_s;
+}
+
+const Tm = extern struct {
+    sec: c_int,
+    min: c_int,
+    hour: c_int,
+    mday: c_int,
+    mon: c_int,
+    year: c_int,
+    wday: c_int,
+    yday: c_int,
+    isdst: c_int,
+    gmtoff: c_long,
+    zone: ?[*:0]const u8,
+};
+extern fn mktime(tm: *Tm) i64;
 
 arena: std.heap.ArenaAllocator,
 path: []const u8,

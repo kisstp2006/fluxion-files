@@ -36,7 +36,7 @@ pub fn themed(self: *Files, kit: *Kit, name: []const u8, size: u16) void {
         kit.ui.empty(.{ .width = .fixed(@floatFromInt(size)), .height = .fixed(@floatFromInt(size)), .image = .{ .texture = texture } });
         return;
     }
-    const glyph: widgets.icons.Name = if (std.mem.startsWith(u8, name, "folder") or std.mem.startsWith(u8, name, "user-")) .folder else if (std.mem.startsWith(u8, name, "drive")) .hard_drive else .document;
+    const glyph: widgets.icons.Name = if (std.mem.startsWith(u8, name, "user-trash")) .delete else if (std.mem.startsWith(u8, name, "folder") or std.mem.startsWith(u8, name, "user-")) .folder else if (std.mem.startsWith(u8, name, "drive")) .hard_drive else .document;
     kit.icon(glyph, size, if (glyph == .folder) widgets.argb(0xFFE8B428) else kit.theme.palette.text_secondary, .filled);
 }
 

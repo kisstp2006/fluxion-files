@@ -232,10 +232,10 @@ pub fn init(self: *Window, gpa: std.mem.Allocator, io: std.Io, title: [:0]const 
     self.surface.commit();
 }
 
-/// Its title bar its own in Windows 11's look - the tabs are in it - and
-/// the compositor's in Windows 10's; framed by the compositor either way.
+/// Its title bar its own in both looks - Windows 11's has the tabs in it,
+/// Windows 10's the Quick Access Toolbar - framed by the compositor.
 fn updateTitleBar(self: *Window) void {
-    const own = self.theme.look.style == .win11;
+    const own = true;
     self.own_title_bar = own;
     if (self.decoration) |d| d.setMode(if (own) .client_side else .server_side);
     if (own and self.frame == null) {

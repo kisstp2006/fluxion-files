@@ -39,6 +39,12 @@ const nav = @import("nav.zig");
 const views = @import("views.zig");
 const actions = @import("actions.zig");
 const menus = @import("menus.zig");
+const win10 = @import("win10.zig");
+const win11 = @import("win11.zig");
+const panes = @import("panes.zig");
+const property_sheet = @import("properties.zig");
+const Search = @import("Search.zig");
+const Thumbs = @import("Thumbs.zig");
 
 const Files = @This();
 
@@ -65,6 +71,15 @@ show_extensions: bool = true,
 /// The navigation pane's width, and whether This PC is open in it.
 nav_width: f32 = 240,
 this_pc_open: bool = true,
+/// Windows 10's Quick access opened in the pane, and the folders opened
+/// in its tree.
+quick_open: bool = true,
+nav_opened: std.ArrayList(nav.Opened) = .empty,
+/// The address bar's "›" opened: the folders in the crumb before it, and
+/// which "›" it was.
+crumb_list: ?nav.Opened = null,
+crumb_anchor_buffer: [32]u8 = undefined,
+crumb_anchor_len: usize = 0,
 /// The address bar turned into a field with the path to type over.
 editing_address: bool = false,
 address_draws: u8 = 0,
@@ -92,6 +107,8 @@ context_at: ?[2]f32 = null,
 context_open: ?[2]f32 = null,
 context_on_item: bool = false,
 context_more: bool = false,
+/// The menu open beside a row of the right-click menu: View ▸, Send to ▸.
+context_sub: menus.Sub = .none,
 /// A middle click, to be answered by what it was on.
 middle_click: bool = false,
 /// The folder in front watched for changes, and when to read it again.
@@ -104,9 +121,42 @@ grid_columns: usize = 1,
 page_chosen: ?void = null,
 page_chosen_buffer: [64]u8 = undefined,
 page_chosen_len: usize = 0,
+/// The navigation pane shown, and the pane on the right: details or
+/// preview, or neither.
+show_nav: bool = true,
+pane: Pane = .none,
+/// View ▸ Show: check boxes on the items; Windows 11's Compact view.
+check_boxes: bool = false,
+compact: bool = false,
+/// Windows 10's ribbon: its tab in front, and whether it is folded to the
+/// tabs' names.
+ribbon_tab: RibbonTab = .home,
+ribbon_folded: bool = false,
+/// The tab whose menu is open.
+tab_menu: usize = 0,
+/// Properties open, for a file or a folder.
+properties: ?property_sheet.Sheet = null,
+/// The picture of the chosen file, for the panes.
+thumbs: Thumbs = undefined,
+/// A search running, and the pipe its thread wakes the window through.
+search: Search = undefined,
+search_wake: [2]std.c.fd_t = .{ -1, -1 },
+/// A rubber band being dragged over the folder: where it began, in the
+/// window's pixels.
+band_from: ?[2]f32 = null,
+/// What was chosen as the band began: what it adds to, with Ctrl.
+band_base: std.ArrayList(bool) = .empty,
+/// A click on the one item chosen: its name to type anew, in a moment.
+rename_pending: ?usize = null,
+rename_pending_ms: i64 = 0,
+/// The photos of the icon views, made on a thread, and its pipe.
+gallery: Thumbs.Gallery = undefined,
+gallery_wake: [2]std.c.fd_t = .{ -1, -1 },
 
-pub const Menu = enum { none, view, sort, more, new };
-pub const Confirm = enum { delete_permanently };
+pub const Menu = enum { none, view, sort, group, more, new, file, move_to, copy_to, recent, tab, crumb };
+pub const Confirm = enum { delete_permanently, empty_trash };
+pub const Pane = enum { none, details, preview };
+pub const RibbonTab = enum { home, share, view, manage, search };
 
 pub fn init(self: *Files, gpa: std.mem.Allocator, io: std.Io, start: ?[]const u8) !void {
     const look = Look.load(io);
@@ -117,6 +167,7 @@ pub fn init(self: *Files, gpa: std.mem.Allocator, io: std.Io, start: ?[]const u8
         .mime = .load(gpa, io),
         .places = .load(gpa, io),
         .open_with = .load(gpa, io),
+        .thumbs = .{ .gpa = gpa, .io = io },
     };
     try self.window.init(gpa, io, "Files", "org.fluxion.Files", look.widgetsMode(), look.widgetsAccent(), look.widgetsLook(), .{
         .context = self,
@@ -137,8 +188,23 @@ pub fn init(self: *Files, gpa: std.mem.Allocator, io: std.Io, start: ?[]const u8
         self.watch_fd = @intCast(watch);
         self.window.addWatch(.{ .fd = @intCast(watch), .context = self, .ready = folderChanged });
     }
-    const first: Tab.Location = if (start) |p| .{ .folder = p } else .home;
+    if (std.c.pipe2(&self.search_wake, .{ .CLOEXEC = true, .NONBLOCK = true }) == 0) {
+        self.window.addWatch(.{ .fd = self.search_wake[0], .context = self, .ready = searchReady });
+    }
+    self.search = .{ .gpa = gpa, .io = io, .wake = self.search_wake[1] };
+    if (std.c.pipe2(&self.gallery_wake, .{ .CLOEXEC = true, .NONBLOCK = true }) == 0) {
+        self.window.addWatch(.{ .fd = self.gallery_wake[0], .context = self, .ready = galleryReady });
+    }
+    self.gallery = .init(gpa, io, self.gallery_wake[1]);
+    const first: Tab.Location = if (start) |p| startPlace(p) else .home;
     self.newTab(first);
+}
+
+/// What a start's argument names: a folder, or a place by its URI.
+fn startPlace(arg: []const u8) Tab.Location {
+    if (std.mem.startsWith(u8, arg, "trash:")) return .trash;
+    if (std.mem.startsWith(u8, arg, "computer:")) return .this_pc;
+    return .{ .folder = arg };
 }
 
 pub fn deinit(self: *Files) void {
@@ -147,6 +213,18 @@ pub fn deinit(self: *Files) void {
         self.gpa.destroy(t);
     }
     self.tabs.deinit(self.gpa);
+    self.search.deinit();
+    for (self.search_wake) |fd| if (fd >= 0) {
+        _ = std.c.close(fd);
+    };
+    self.gallery.deinit();
+    for (self.gallery_wake) |fd| if (fd >= 0) {
+        _ = std.c.close(fd);
+    };
+    self.band_base.deinit(self.gpa);
+    nav.forget(self);
+    if (self.crumb_list) |l| l.free(self.gpa);
+    self.nav_opened.deinit(self.gpa);
     if (self.apps) |*a| a.deinit();
     for (self.clipboard.items) |p| self.gpa.free(p);
     self.clipboard.deinit(self.gpa);
@@ -206,6 +284,27 @@ pub fn closeTab(self: *Files, index: usize) void {
     self.arrived();
 }
 
+/// Every tab but `keep` closed.
+pub fn closeOtherTabs(self: *Files, keep: usize) void {
+    if (keep >= self.tabs.items.len) return;
+    const kept = self.tabs.items[keep];
+    for (self.tabs.items) |t| if (t != kept) {
+        t.deinit();
+        self.gpa.destroy(t);
+    };
+    self.tabs.clearRetainingCapacity();
+    self.tabs.append(self.gpa, kept) catch {};
+    self.active = 0;
+    self.arrived();
+}
+
+/// Another window of Files: a process of its own, at the folder in front.
+pub fn openNewWindow(self: *Files) void {
+    var buffer: [std.fs.max_path_bytes + 32]u8 = undefined;
+    const line = std.fmt.bufPrint(&buffer, "fluxion-files {s}", .{self.tab().path() orelse ""}) catch return;
+    apps_mod.run(self.gpa, self.io, "Files", line, null);
+}
+
 pub fn switchTab(self: *Files, index: usize) void {
     if (index >= self.tabs.items.len) return;
     self.active = index;
@@ -230,6 +329,9 @@ pub fn goForward(self: *Files) void {
 }
 
 pub fn goUp(self: *Files) void {
+    // From Home, or a person's folder at the top, up is This PC... as
+    // Windows has it; from a folder, its parent.
+    if (self.tab().location == .home) return self.goTo(.this_pc);
     const parent = self.tab().parentPath() orelse return;
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const copy = std.fmt.bufPrint(&buffer, "{s}", .{parent}) catch return;
@@ -244,8 +346,182 @@ pub fn refresh(self: *Files) void {
 
 /// Every tab showing a folder read again: something was done to files.
 pub fn refreshAll(self: *Files) void {
-    for (self.tabs.items) |t| if (t.path() != null) t.read(self.io, &self.mime, self.show_hidden);
+    for (self.tabs.items) |t| if (t.path() != null or t.location == .trash) t.read(self.io, &self.mime, self.show_hidden);
     self.window.redraw();
+}
+
+pub fn toggleHidden(self: *Files) void {
+    self.show_hidden = !self.show_hidden;
+    for (self.tabs.items) |each| each.refilter(self.show_hidden);
+    self.window.redraw();
+}
+
+pub fn togglePane(self: *Files, which: Pane) void {
+    self.pane = if (self.pane == which) .none else which;
+    self.window.redraw();
+}
+
+pub fn sortBy(self: *Files, by: Folder.Column) void {
+    self.tab().sortBy(by, &self.mime, self.show_hidden);
+    self.window.redraw();
+}
+
+/// Ascending or descending, by what it is sorted by.
+pub fn sortOrder(self: *Files, ascending: bool) void {
+    const t = self.tab();
+    t.ascending = ascending;
+    if (t.folder) |*f| f.sort(t.sort_by, ascending, &self.mime);
+    t.refilter(self.show_hidden);
+    self.window.redraw();
+}
+
+pub fn groupBy(self: *Files, by: ?Folder.Column) void {
+    self.tab().groupBy(by, self.show_hidden);
+    self.window.redraw();
+}
+
+/// Properties: of the one item chosen, or of the folder shown.
+pub fn openProperties(self: *Files) void {
+    const t = self.tab();
+    self.menu = .none;
+    self.context_open = null;
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    if (t.selectedCount() >= 1) if (t.current()) |i| {
+        const e = t.entry(i);
+        const dir = t.dirOf(e) orelse return;
+        const full = @import("Ops.zig").join(&buffer, dir, e.name) catch return;
+        return property_sheet.open(self, full, e.isFolder(), e.mime);
+    };
+    if (t.path()) |p| property_sheet.open(self, p, true, Mime.directory);
+}
+
+/// What the search box says now: searched for under the folder in front -
+/// or, emptied, that folder again.
+pub fn searchChanged(self: *Files) void {
+    const t = self.tab();
+    const typed = std.mem.trim(u8, self.window.layout.textValueOf("search/field") orelse "", " \t");
+    const folder: []const u8 = switch (t.location) {
+        .folder => |p| p,
+        .search => |q| q.folder,
+        // From Home and This PC, the home folder.
+        else => self.places.home,
+    };
+    var folder_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const from = std.fmt.bufPrint(&folder_buffer, "{s}", .{folder}) catch return;
+    if (typed.len == 0) {
+        self.search.stop();
+        if (t.location == .search) {
+            t.replace(.{ .folder = from });
+            self.arrived();
+        }
+        return;
+    }
+    var query_buffer: [256]u8 = undefined;
+    const query = std.fmt.bufPrint(&query_buffer, "{s}", .{typed}) catch return;
+    if (t.location == .search) t.replace(.{ .search = .{ .folder = from, .query = query } }) else {
+        t.go(.{ .search = .{ .folder = from, .query = query } });
+        // Windows 10 turns to the Search tab as a search begins.
+        if (self.ten()) self.ribbon_tab = .search;
+    }
+    t.folder = Folder.empty(self.gpa, "Search");
+    t.refilter(self.show_hidden);
+    self.search.start(from, query);
+    self.window.redraw();
+}
+
+/// Search `folder` for `query`, the box saying what is searched for.
+pub fn searchIn(self: *Files, folder: []const u8, query: []const u8) void {
+    var folder_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const from = std.fmt.bufPrint(&folder_buffer, "{s}", .{folder}) catch return;
+    var query_buffer: [256]u8 = undefined;
+    const what = std.fmt.bufPrint(&query_buffer, "{s}", .{query}) catch return;
+    const t = self.tab();
+    if (t.location == .search) t.replace(.{ .search = .{ .folder = from, .query = what } }) else t.go(.{ .search = .{ .folder = from, .query = what } });
+    t.folder = Folder.empty(self.gpa, "Search");
+    t.refilter(self.show_hidden);
+    self.search.start(from, what);
+    self.window.layout.setTextValue("search/field", what);
+    self.window.redraw();
+}
+
+/// Close search: the folder searched, again.
+pub fn closeSearch(self: *Files) void {
+    self.window.layout.setTextValue("search/field", "");
+    self.searchChanged();
+}
+
+/// The person's folder `path` is, or is in: Documents, Pictures.
+pub fn knownFolderOf(self: *Files, path: []const u8) ?Places.Folder {
+    for (self.places.user.items) |f| {
+        // A folder not set up is the home folder itself: not one of them.
+        if (std.mem.eql(u8, f.path, self.places.home)) continue;
+        if (std.mem.startsWith(u8, path, f.path) and (path.len == f.path.len or path[f.path.len] == '/')) return f;
+    }
+    return null;
+}
+
+/// The drive chosen on This PC.
+pub fn chosenDrive(self: *Files) ?Places.Drive {
+    if (self.page_chosen == null) return null;
+    const id = self.page_chosen_buffer[0..self.page_chosen_len];
+    const prefix = "pc/drive/";
+    if (!std.mem.startsWith(u8, id, prefix)) return null;
+    const i = std.fmt.parseInt(usize, id[prefix.len..], 10) catch return null;
+    if (i >= self.places.drives.items.len) return null;
+    return self.places.drives.items[i];
+}
+
+pub fn searching(self: *Files) bool {
+    return self.tab().location == .search and self.search.running();
+}
+
+/// The gallery's thread made pictures: into the window, and drawn.
+fn galleryReady(context: *anyopaque) void {
+    const self: *Files = @ptrCast(@alignCast(context));
+    var drain: [256]u8 = undefined;
+    while (std.c.read(self.gallery_wake[0], &drain, drain.len) > 0) {}
+    if (self.gallery.take(&self.window.icons)) self.window.redraw();
+}
+
+/// The search's thread found more: into the list.
+fn searchReady(context: *anyopaque) void {
+    const self: *Files = @ptrCast(@alignCast(context));
+    var drain: [256]u8 = undefined;
+    while (std.c.read(self.search_wake[0], &drain, drain.len) > 0) {}
+    const t = self.tab();
+    if (t.location != .search) return;
+    var found: std.ArrayList([]u8) = .empty;
+    defer {
+        for (found.items) |p| self.gpa.free(p);
+        found.deinit(self.gpa);
+    }
+    self.search.take(&found);
+    const folder = &(t.folder orelse return);
+    for (found.items) |full| folder.addFound(self.io, &self.mime, full);
+    // Kept in the order searched; the list grows below what is chosen.
+    const keep_selected = t.selected.items.len;
+    const old: []bool = self.gpa.dupe(bool, t.selected.items) catch &.{};
+    defer self.gpa.free(old);
+    t.refilter(self.show_hidden);
+    for (old, 0..) |sel, i| if (i < keep_selected and i < t.selected.items.len) {
+        t.selected.items[i] = sel;
+    };
+    self.window.redraw();
+}
+
+/// The name a place goes by in a list of them: Recent locations.
+pub fn locationName(self: *Files, l: Tab.Location, buffer: []u8) []const u8 {
+    return switch (l) {
+        .home => if (self.ten()) "Quick access" else "Home",
+        .this_pc => "This PC",
+        .trash => "Recycle Bin",
+        .search => |q| std.fmt.bufPrint(buffer, "Search results in {s}", .{std.fs.path.basename(q.folder)}) catch "Search",
+        .folder => |p| std.fmt.bufPrint(buffer, "{s}", .{if (std.mem.eql(u8, p, "/")) "/" else std.fs.path.basename(p)}) catch "",
+    };
+}
+
+pub fn arrivedPublic(self: *Files) void {
+    self.arrived();
 }
 
 /// Say what went wrong, at the top of the folder.
@@ -304,7 +580,13 @@ fn arrived(self: *Files) void {
     self.page_chosen = null;
     self.renaming = null;
     self.notice_len = 0;
-    if (t.path() != null and t.folder == null) t.read(self.io, &self.mime, self.show_hidden);
+    if ((t.path() != null or t.location == .trash) and t.folder == null) t.read(self.io, &self.mime, self.show_hidden);
+    // Left a search: it stops, and the box is emptied.
+    if (t.location != .search) {
+        self.search.stop();
+        const typed: []const u8 = self.window.layout.textValueOf("search/field") orelse "";
+        if (typed.len > 0) self.window.layout.setTextValue("search/field", "");
+    }
     self.watchFolder();
     self.window.layout.scrollTo("view/scroll", 0, 0);
     var buffer: [256]u8 = undefined;
@@ -317,6 +599,8 @@ pub fn titleOf(self: *Files, t: *const Tab, buffer: []u8) []const u8 {
     return switch (t.location) {
         .home => if (self.ten()) "Quick access" else "Home",
         .this_pc => "This PC",
+        .trash => "Recycle Bin",
+        .search => |q| std.fmt.bufPrint(buffer, "Search Results in {s}", .{std.fs.path.basename(q.folder)}) catch "Search Results",
         .folder => |p| blk: {
             if (std.mem.eql(u8, p, "/")) break :blk "Local Disk";
             if (std.mem.eql(u8, p, self.places.home)) break :blk std.fs.path.basename(p);
@@ -336,8 +620,11 @@ pub fn open(self: *Files, i: usize, new_tab: bool) void {
     const t = self.tab();
     if (i >= t.count()) return;
     const e = t.entry(i);
+    // In the Recycle Bin, a file is not opened: its properties are.
+    if (t.location == .trash) return;
+    const dir = t.dirOf(e) orelse return;
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const full = std.fmt.bufPrint(&buffer, "{s}/{s}", .{ if (std.mem.eql(u8, t.path().?, "/")) "" else t.path().?, e.name }) catch return;
+    const full = std.fmt.bufPrint(&buffer, "{s}/{s}", .{ if (std.mem.eql(u8, dir, "/")) "" else dir, e.name }) catch return;
     if (e.isFolder()) {
         if (new_tab and !self.ten()) self.newTab(.{ .folder = full }) else self.goTo(.{ .folder = full });
         return;
@@ -354,13 +641,26 @@ pub fn openFile(self: *Files, path: []const u8, mime: []const u8) void {
     apps_mod.runWith(self.gpa, self.io, app.name, app.exec, path);
 }
 
+/// A search's finding shown where it is: its folder opened, it chosen.
+pub fn openFileLocation(self: *Files) void {
+    const t = self.tab();
+    const i = t.current() orelse return;
+    const e = t.entry(i);
+    var dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = std.fmt.bufPrint(&dir_buffer, "{s}", .{t.dirOf(e) orelse return}) catch return;
+    var name_buffer: [256]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buffer, "{s}", .{e.name}) catch return;
+    self.goTo(.{ .folder = dir });
+    actions.choose(self, &.{name});
+}
+
 pub fn installedApps(self: *Files) ?*const apps_mod.Apps {
     if (self.apps == null) self.apps = apps_mod.load(self.gpa, self.io) catch return null;
     return &self.apps.?;
 }
 
 /// The path the address bar was given: `~`, a folder, a file's folder.
-fn goToTyped(self: *Files, typed: []const u8) void {
+pub fn goToTyped(self: *Files, typed: []const u8) void {
     const trimmed = std.mem.trim(u8, typed, " \t");
     if (trimmed.len == 0) return;
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -440,26 +740,29 @@ fn draw(context: *anyopaque, window: *Window, kit: *Kit) void {
         .background_color = if (window.mica) .transparent else p.solid_base,
     });
     defer u.close();
-    if (window.own_title_bar) chrome.titleBar(self, kit);
     // Windows 10's ribbon is over the address row; Windows 11's command
     // bar under it.
     if (self.ten()) {
-        chrome.ribbon(self, kit);
+        if (window.own_title_bar) win10.titleBar(self, kit);
+        win10.ribbon(self, kit);
         chrome.addressRow(self, kit);
     } else {
+        if (window.own_title_bar) win11.titleBar(self, kit);
         chrome.addressRow(self, kit);
-        chrome.commandBar(self, kit);
+        win11.commandBar(self, kit);
     }
     {
         u.open(.{ .id = "body", .width = .grow, .height = .grow });
         defer u.close();
-        nav.pane(self, kit);
+        if (self.show_nav) nav.pane(self, kit);
         views.content(self, kit);
+        panes.pane(self, kit);
     }
     chrome.statusBar(self, kit);
     chrome.menus(self, kit);
     menus.context(self, kit);
     menus.confirmDialog(self, kit);
+    property_sheet.draw(self, kit);
     // A right or middle click on nothing that took it.
     self.context_at = null;
     self.middle_click = false;
@@ -512,6 +815,10 @@ fn key(context: *anyopaque, window: *Window, sym: xkb.Keysym) bool {
             else => return false,
         }
     }
+    if (self.properties != null) {
+        if (code == K.Escape) self.properties = null;
+        return code == K.Escape;
+    }
     if (self.confirm != null) {
         switch (code) {
             K.Escape, K.n, K.N => self.confirm = null,
@@ -537,6 +844,21 @@ fn key(context: *anyopaque, window: *Window, sym: xkb.Keysym) bool {
         return true;
     }
 
+    if (alt) switch (code) {
+        K.p, K.P => {
+            self.togglePane(if (shift) .details else .preview);
+            return true;
+        },
+        K.Return, K.KP_Enter => {
+            self.openProperties();
+            return true;
+        },
+        else => {},
+    };
+    if (ctrl and code == K.F1 and self.ten()) {
+        self.ribbon_folded = !self.ribbon_folded;
+        return true;
+    }
     switch (code) {
         K.Left => if (alt) {
             self.goBack();
@@ -619,6 +941,10 @@ fn key(context: *anyopaque, window: *Window, sym: xkb.Keysym) bool {
         },
         K.r, K.R => {
             self.refresh();
+            return true;
+        },
+        K.n, K.N => {
+            self.openNewWindow();
             return true;
         },
         else => {},

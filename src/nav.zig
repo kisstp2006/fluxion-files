@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: BSD-2-Clause
 
-//! The navigation pane down the left:
-//! - Home (Windows 10's: Quick access), then the person's folders and the
-//!   ones pinned, each with a pin;
-//! - This PC, opening to its drives;
-//! - Network.
+//! The navigation pane down the left, a tree as Windows' is:
 //!
-//! The place shown is lit, as Windows lights it.
+//! - **Windows 10's**: Quick access, opening to the person's folders and
+//!   the ones pinned, each with its pin, and the Recycle Bin; This PC,
+//!   opening to the same folders and the drives; Network. The chevrons
+//!   show while the pointer is on the pane, as Windows 10 fades them in.
+//! - **Windows 11's**: Home; the person's folders and the pinned ones,
+//!   each with its pin, and the Recycle Bin; This PC, opening to the
+//!   drives; Network.
+//!
+//! Any folder opens to the folders in it, read when it is opened. The place
+//! shown is lit, as Windows lights it.
 
 const std = @import("std");
 
@@ -16,9 +21,89 @@ const Kit = widgets.Kit;
 
 const Files = @import("Files.zig");
 const Tab = @import("Tab.zig");
-const Places = @import("Places.zig");
+const Folder = @import("Folder.zig");
 const chrome = @import("chrome.zig");
 const icons = @import("icons.zig");
+
+/// A folder opened in the tree, and the folders in it, read when it was.
+pub const Opened = struct {
+    path: []u8,
+    children: [][]u8,
+
+    pub fn free(self: Opened, gpa: std.mem.Allocator) void {
+        for (self.children) |c| gpa.free(c);
+        gpa.free(self.children);
+        gpa.free(self.path);
+    }
+};
+
+/// Whether `path` is opened in the tree, and where in the list.
+fn openedAt(self: *Files, path: []const u8) ?usize {
+    for (self.nav_opened.items, 0..) |o, i| if (std.mem.eql(u8, o.path, path)) return i;
+    return null;
+}
+
+/// Open `path` in the tree - its folders read, by name as Windows sorts
+/// them - or close it.
+fn toggle(self: *Files, path: []const u8) void {
+    if (openedAt(self, path)) |i| {
+        self.nav_opened.orderedRemove(i).free(self.gpa);
+        return;
+    }
+    const read = readFolders(self, path) orelse return;
+    self.nav_opened.append(self.gpa, read) catch read.free(self.gpa);
+}
+
+/// The folders in `path`, by name as Windows sorts them.
+pub fn readFolders(self: *Files, path: []const u8) ?Opened {
+    var children: std.ArrayList([]u8) = .empty;
+    if (std.Io.Dir.cwd().openDir(self.io, path, .{ .iterate = true })) |opened_dir| {
+        var dir = opened_dir;
+        defer dir.close(self.io);
+        var it = dir.iterate();
+        while (it.next(self.io) catch null) |entry| {
+            if (entry.name[0] == '.' and !self.show_hidden) continue;
+            const is_dir = entry.kind == .directory or (entry.kind == .sym_link and isDir(self, path, entry.name));
+            if (!is_dir) continue;
+            children.append(self.gpa, self.gpa.dupe(u8, entry.name) catch continue) catch {};
+        }
+    } else |_| {}
+    std.sort.block([]u8, children.items, {}, struct {
+        fn lessThan(_: void, a: []u8, b: []u8) bool {
+            return Folder.naturalOrder(a, b) == .lt;
+        }
+    }.lessThan);
+    const owned = children.toOwnedSlice(self.gpa) catch return null;
+    const copy = self.gpa.dupe(u8, path) catch {
+        for (owned) |c| self.gpa.free(c);
+        self.gpa.free(owned);
+        return null;
+    };
+    return .{ .path = copy, .children = owned };
+}
+
+fn isDir(self: *Files, dir: []const u8, name: []const u8) bool {
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const full = std.fmt.bufPrint(&buffer, "{s}/{s}", .{ dir, name }) catch return false;
+    const stat = std.Io.Dir.cwd().statFile(self.io, full, .{}) catch return false;
+    return stat.kind == .directory;
+}
+
+/// Forget the tree: the folders it shows read again as they are opened.
+pub fn forget(self: *Files) void {
+    for (self.nav_opened.items) |o| o.free(self.gpa);
+    self.nav_opened.clearRetainingCapacity();
+}
+
+/// Where a click in the pane goes, the frame it is clicked.
+const Going = struct {
+    to: ?Tab.Location = null,
+    buffer: [std.fs.max_path_bytes]u8 = undefined,
+
+    fn folder(self: *Going, path: []const u8) void {
+        self.to = .{ .folder = std.fmt.bufPrint(&self.buffer, "{s}", .{path}) catch path };
+    }
+};
 
 pub fn pane(self: *Files, kit: *Kit) void {
     const u = kit.ui;
@@ -29,45 +114,104 @@ pub fn pane(self: *Files, kit: *Kit) void {
         .width = .fixed(self.nav_width),
         .height = .grow,
         .direction = .top_to_bottom,
-        .padding = .trbl(if (ten) 2 else 4, if (ten) 0 else 4, 4, if (ten) 0 else 4),
+        .padding = .trbl(4, if (ten) 0 else 4, 4, if (ten) 0 else 4),
         .gap = 0,
         .background_color = chrome.contentColor(kit),
-        .border = .{ .color = p.divider, .width = .{ .right = 1 } },
-        .clip = .{ .vertical = true, .scroll_y = true, .no_drag_scroll = true },
+        .border = if (ten) .{} else .{ .color = p.divider, .width = .{ .right = 1 } },
+        .clip = .{
+            .vertical = true,
+            .scroll_y = true,
+            .no_drag_scroll = true,
+            .scrollbar = .{ .width = if (ten) 8 else 6, .corner_radius = if (ten) 0 else 3, .thumb_color = p.text_tertiary, .hide_after_seconds = 1.5 },
+        },
     });
     defer u.close();
-    var to: ?Tab.Location = null;
-    var to_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const t = self.tab();
-    const here = t.location;
+    var going: Going = .{};
+    const here = self.tab().location;
+    // Windows 10 shows the chevrons only while the pointer is on the pane.
+    const chevrons = !ten or u.isPointerOver("nav");
 
-    if (item(self, kit, "nav/home", 0, if (ten) .star else .home, null, if (ten) "Quick access" else "Home", here == .home, null)) to = .home;
-    if (!ten) separator(kit);
-    // The person's folders, pinned as Windows pins them by default, and
-    // GTK's bookmarks after them.
-    for (self.places.user.items, 0..) |f, i| {
-        const lit = here == .folder and std.mem.eql(u8, here.folder, f.path);
-        if (item(self, kit, kit.print("nav/user/{d}", .{i}), if (ten) 1 else 0, null, icons.special(f.special), f.name, lit, true)) to = .{ .folder = std.fmt.bufPrint(&to_buffer, "{s}", .{f.path}) catch f.path };
-    }
-    for (self.places.pinned.items, 0..) |f, i| {
-        const lit = here == .folder and std.mem.eql(u8, here.folder, f.path);
-        if (item(self, kit, kit.print("nav/pin/{d}", .{i}), if (ten) 1 else 0, null, "folder", f.name, lit, true)) to = .{ .folder = std.fmt.bufPrint(&to_buffer, "{s}", .{f.path}) catch f.path };
-    }
-    if (!ten) separator(kit);
-    {
-        const lit = here == .this_pc;
-        if (expandable(self, kit, "nav/pc", .desktop, "This PC", lit, &self.this_pc_open)) to = .this_pc;
-        if (self.this_pc_open) {
-            for (self.places.drives.items, 0..) |d, i| {
-                const is_here = here == .folder and std.mem.eql(u8, here.folder, d.mount);
-                var name_buffer: [256]u8 = undefined;
-                const name = std.fmt.bufPrint(&name_buffer, "{s} ({s})", .{ d.label, d.mount }) catch d.label;
-                if (item(self, kit, kit.print("nav/drive/{d}", .{i}), 1, null, if (d.removable) "drive-removable-media" else "drive-harddisk", name, is_here, null)) to = .{ .folder = std.fmt.bufPrint(&to_buffer, "{s}", .{d.mount}) catch d.mount };
-            }
+    if (ten) {
+        switch (row(self, kit, "nav/home", 0, .{ .glyph = .star }, "Quick access", here == .home, if (chevrons) self.quick_open else null, false)) {
+            .go => going.to = .home,
+            .toggle => self.quick_open = !self.quick_open,
+            .none => {},
         }
+        if (self.quick_open) pinnedFolders(self, kit, &going, 1, chevrons);
+        gap(kit);
+        switch (row(self, kit, "nav/pc", 0, .{ .glyph = .desktop }, "This PC", here == .this_pc, if (chevrons) self.this_pc_open else null, false)) {
+            .go => going.to = .this_pc,
+            .toggle => self.this_pc_open = !self.this_pc_open,
+            .none => {},
+        }
+        if (self.this_pc_open) {
+            for (self.places.user.items, 0..) |f, i| folderRow(self, kit, &going, kit.print("nav/pc/user/{d}", .{i}), 1, f.path, f.name, icons.special(f.special), false, chevrons);
+            drives(self, kit, &going, chevrons);
+        }
+        gap(kit);
+        _ = row(self, kit, "nav/network", 0, .{ .glyph = .globe }, "Network", false, if (chevrons) false else null, false);
+    } else {
+        if (row(self, kit, "nav/home", 0, .{ .glyph = .home }, "Home", here == .home, null, false) == .go) going.to = .home;
+        separator(kit);
+        pinnedFolders(self, kit, &going, 0, chevrons);
+        separator(kit);
+        switch (row(self, kit, "nav/pc", 0, .{ .glyph = .desktop }, "This PC", here == .this_pc, self.this_pc_open, false)) {
+            .go => going.to = .this_pc,
+            .toggle => self.this_pc_open = !self.this_pc_open,
+            .none => {},
+        }
+        if (self.this_pc_open) drives(self, kit, &going, chevrons);
+        _ = row(self, kit, "nav/network", 0, .{ .glyph = .globe }, "Network", false, false, false);
     }
-    _ = item(self, kit, "nav/network", 0, .globe, null, "Network", false, null);
-    if (to) |where| self.goTo(where);
+    if (going.to) |where| self.goTo(where);
+}
+
+/// The person's folders and the pinned ones, a pin at each; then the
+/// Recycle Bin.
+fn pinnedFolders(self: *Files, kit: *Kit, going: *Going, depth: u8, chevrons: bool) void {
+    const here = self.tab().location;
+    for (self.places.user.items, 0..) |f, i| folderRow(self, kit, going, kit.print("nav/user/{d}", .{i}), depth, f.path, f.name, icons.special(f.special), true, chevrons);
+    for (self.places.pinned.items, 0..) |f, i| folderRow(self, kit, going, kit.print("nav/pin/{d}", .{i}), depth, f.path, f.name, "folder", true, chevrons);
+    if (row(self, kit, "nav/trash", depth, .{ .themed = "user-trash" }, "Recycle Bin", here == .trash, null, false) == .go) going.to = .trash;
+}
+
+fn drives(self: *Files, kit: *Kit, going: *Going, chevrons: bool) void {
+    for (self.places.drives.items, 0..) |d, i| {
+        var name_buffer: [256]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buffer, "{s} ({s})", .{ d.label, d.mount }) catch d.label;
+        folderRow(self, kit, going, kit.print("nav/drive/{d}", .{i}), 1, d.mount, name, if (d.removable) "drive-removable-media" else "drive-harddisk", false, chevrons);
+    }
+}
+
+/// A folder's row, and - opened - the folders in it under it, each a
+/// row that opens in turn.
+fn folderRow(self: *Files, kit: *Kit, going: *Going, id: []const u8, depth: u8, path: []const u8, name: []const u8, icon: []const u8, pinned: bool, chevrons: bool) void {
+    const here = self.tab().location;
+    const lit = here == .folder and std.mem.eql(u8, here.folder, path);
+    const opened = openedAt(self, path);
+    // The id is a print of the kit's: kept before the rows under it print.
+    var id_buffer: [128]u8 = undefined;
+    const own_id = std.fmt.bufPrint(&id_buffer, "{s}", .{id}) catch id;
+    switch (row(self, kit, own_id, depth, .{ .themed = icon }, name, lit, if (chevrons) opened != null else null, pinned)) {
+        .go => going.folder(path),
+        .toggle => {
+            toggle(self, path);
+            self.window.redraw();
+            return;
+        },
+        .none => {},
+    }
+    const at = opened orelse return;
+    // Deep enough: the tree is not a list of the whole disk.
+    if (depth >= 12) return;
+    const children = self.nav_opened.items[at].children;
+    for (children, 0..) |child, k| {
+        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const full = std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ if (std.mem.eql(u8, path, "/")) "" else path, child }) catch continue;
+        folderRow(self, kit, going, kit.print("{s}/{d}", .{ own_id, k }), depth + 1, full, child, icons.special(self.places.specialOf(full)), false, chevrons);
+        // A row opened or closed under it: the list walked is not the same.
+        if (at >= self.nav_opened.items.len or self.nav_opened.items[at].children.ptr != children.ptr) return;
+    }
 }
 
 fn separator(kit: *Kit) void {
@@ -77,10 +221,17 @@ fn separator(kit: *Kit) void {
     u.close();
 }
 
-/// A row: a glyph or a themed icon, the name; lit where it is shown. A
-/// pinned one has the pin at its end, as Windows 11's has. True when
-/// clicked.
-fn item(self: *Files, kit: *Kit, id: []const u8, depth: u8, glyph: ?widgets.icons.Name, icon_name: ?[]const u8, name: []const u8, lit: bool, pinned: ?bool) bool {
+/// Windows 10 parts the tree's roots with a little room.
+fn gap(kit: *Kit) void {
+    kit.ui.empty(.{ .width = .grow, .height = .fixed(10) });
+}
+
+const Icon = union(enum) { glyph: widgets.icons.Name, themed: []const u8 };
+const Clicked = enum { none, go, toggle };
+
+/// A row of the tree: its chevron where it opens (`open` not null), its
+/// icon and name, and - pinned - the pin at its end. Lit where it is shown.
+fn row(self: *Files, kit: *Kit, id: []const u8, depth: u8, icon: Icon, name: []const u8, lit: bool, open: ?bool, pinned: bool) Clicked {
     const u = kit.ui;
     const p = &kit.theme.palette;
     const ten = self.ten();
@@ -88,14 +239,14 @@ fn item(self: *Files, kit: *Kit, id: []const u8, depth: u8, glyph: ?widgets.icon
     u.open(.{
         .id = id,
         .width = .grow,
-        .height = .fixed(if (ten) 24 else 32),
-        .padding = .trbl(0, 8, 0, 8 + 16 * @as(u16, depth)),
-        .gap = 8,
+        .height = .fixed(if (ten) 22 else if (self.compact) 24 else 28),
+        .padding = .trbl(0, 8, 0, (if (ten) @as(u16, 2) else 4) + (if (ten) @as(u16, 16) else 14) * @as(u16, depth)),
+        .gap = if (ten) 4 else 6,
         .align_y = .center,
         .corner_radius = .all(if (ten) 0 else 4),
         .background_color = if (lit)
             (if (ten) win10Selection(kit) else p.subtle_secondary)
-        else if (u.isElementPressed(id))
+        else if (!ten and u.isElementPressed(id))
             p.subtle_tertiary
         else if (hovered)
             (if (ten) win10Hover(kit) else p.subtle_secondary)
@@ -103,52 +254,32 @@ fn item(self: *Files, kit: *Kit, id: []const u8, depth: u8, glyph: ?widgets.icon
             .transparent,
     });
     defer u.close();
-    // Windows 11 leaves room where a tree's chevron would be.
-    if (!ten) u.empty(.{ .width = .fixed(12) });
-    if (glyph) |g| kit.icon(g, 16, if (g == .star) widgets.argb(0xFF2B88D8) else if (g == .home) p.accent_text else p.text_primary, .regular);
-    if (icon_name) |n| icons.themed(self, kit, n, 16);
-    u.open(.{ .width = .grow, .clip = .both });
-    var style = kit.style(.body, p.text_primary);
-    style.wrap = .none;
-    u.text(name, style);
-    u.close();
-    if (pinned != null and !ten) kit.icon(.pin, 12, p.text_secondary, .regular);
-    return u.justReleased();
-}
-
-/// A row that opens to more under it: its chevron opens or closes it, the
-/// rest goes there.
-fn expandable(self: *Files, kit: *Kit, id: []const u8, glyph: widgets.icons.Name, name: []const u8, lit: bool, open: *bool) bool {
-    const u = kit.ui;
-    const p = &kit.theme.palette;
-    const ten = self.ten();
-    const hovered = u.isPointerOver(id);
-    u.open(.{
-        .id = id,
-        .width = .grow,
-        .height = .fixed(if (ten) 24 else 32),
-        .padding = .xy(if (ten) 2 else 4, 0),
-        .gap = 8,
-        .align_y = .center,
-        .corner_radius = .all(if (ten) 0 else 4),
-        .background_color = if (lit) (if (ten) win10Selection(kit) else p.subtle_secondary) else if (hovered) (if (ten) win10Hover(kit) else p.subtle_secondary) else .transparent,
-    });
-    defer u.close();
     const chevron_id = kit.print("{s}/chevron", .{id});
     u.open(.{ .id = chevron_id, .width = .fixed(16), .height = .fixed(16), .align_x = .center, .align_y = .center });
-    if (hovered or !ten or open.*) kit.icon(if (open.*) .chevron_down else .chevron_right, 12, p.text_secondary, .regular);
-    const toggled = u.justReleased();
-    u.close();
-    if (toggled) {
-        open.* = !open.*;
-        return false;
+    if (open) |is_open| {
+        const ink = if (u.isPointerOver(chevron_id)) (if (ten) widgets.argb(0xFF1C97EA) else p.text_primary) else p.text_secondary;
+        kit.icon(if (is_open) .chevron_down else .chevron_right, if (ten) 10 else 12, ink, .regular);
     }
-    kit.icon(glyph, 16, p.text_primary, .regular);
-    var style = kit.style(.body, p.text_primary);
-    style.wrap = .none;
-    u.text(name, style);
-    u.empty(.{ .width = .grow });
-    return u.justReleased() and !u.isPointerOver(chevron_id);
+    const on_chevron = open != null and u.isPointerOver(chevron_id);
+    u.close();
+    switch (icon) {
+        .glyph => |g| kit.icon(g, 16, switch (g) {
+            .star => widgets.argb(0xFF2B88D8),
+            .home => p.accent_text,
+            else => p.text_primary,
+        }, if (g == .star) .filled else .regular),
+        .themed => |n| icons.themed(self, kit, n, 16),
+    }
+    {
+        u.open(.{ .width = .grow, .clip = .both, .padding = .trbl(0, 0, 0, 2) });
+        defer u.close();
+        var style = kit.style(.caption, p.text_primary);
+        style.wrap = .none;
+        u.text(name, style);
+    }
+    if (pinned) kit.icon(.pin, if (ten) 10 else 12, p.text_secondary, .regular);
+    if (!u.justReleased()) return .none;
+    return if (on_chevron) .toggle else .go;
 }
 
 /// Windows 10's: light blue for what is chosen and under the pointer.

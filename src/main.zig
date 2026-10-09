@@ -51,4 +51,7 @@ test {
     _ = @import("views.zig");
     _ = @import("ImageFile.zig");
     _ = @import("apps.zig");
+    _ = @import("Search.zig");
+    _ = @import("Thumbs.zig");
+    _ = @import("Tab.zig");
 }

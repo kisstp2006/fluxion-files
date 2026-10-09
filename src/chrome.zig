@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: BSD-2-Clause
 
-//! What frames the folder: the title bar with the tabs (Windows 11's look),
-//! the address row, Windows 11's command bar or Windows 10's ribbon, the
-//! status bar, and the menus they open.
+//! What frames the folder in both looks: the address row, the status bar,
+//! and the menus the command bar and the ribbon open. The title bars, the
+//! command bar and the ribbon are each look's own: `win11.zig`, `win10.zig`.
 
 const std = @import("std");
 
@@ -14,136 +14,31 @@ const Color = ui.Color;
 const Files = @import("Files.zig");
 const Tab = @import("Tab.zig");
 const Folder = @import("Folder.zig");
-const Window = @import("Window.zig");
 const actions = @import("actions.zig");
-
-/// The title bar's height in Windows 11's look, the tabs at its foot.
-const title_h = 40;
-const tab_h = 32;
-const caption_w = 46;
-/// How long the pointer rests on the maximise button before the layouts.
-const maximize_rest_ms = 400;
+const win10 = @import("win10.zig");
+const win11 = @import("win11.zig");
+const menus_mod = @import("menus.zig");
+const icons = @import("icons.zig");
+const nav = @import("nav.zig");
 
 /// The surface the address row and the command bar are on - which the tab
-/// in front joins - and the one the folder is on.
+/// in front joins.
 pub fn toolbarColor(kit: *Kit) Color {
     const p = &kit.theme.palette;
-    if (kit.theme.look.style == .win10) return p.solid_base;
+    if (kit.theme.look.style == .win10) return win10.windowColor(kit);
     return if (p.mode == .dark) widgets.argb(0xFF2C2C2C) else widgets.argb(0xFFF9F9F9);
 }
 
+/// The surface the folder and the navigation pane are on.
 pub fn contentColor(kit: *Kit) Color {
     const p = &kit.theme.palette;
-    if (kit.theme.look.style == .win10) return p.solid_base;
+    if (kit.theme.look.style == .win10) return win10.windowColor(kit);
     return if (p.mode == .dark) widgets.argb(0xFF191919) else widgets.argb(0xFFFFFFFF);
 }
 
-// -------------------------------------------------------------------------
-// The title bar, the tabs in it
-// -------------------------------------------------------------------------
-
-pub fn titleBar(self: *Files, kit: *Kit) void {
-    const u = kit.ui;
-    const p = &kit.theme.palette;
-    const window = &self.window;
-    u.open(.{ .id = "titlebar", .width = .grow, .height = .fixed(title_h), .align_y = .bottom, .padding = .trbl(0, 0, 0, 8) });
-    defer u.close();
-    const ink = if (window.activated) p.text_primary else p.text_secondary;
-    {
-        u.open(.{ .id = "tabs", .height = .fixed(tab_h), .align_y = .center, .gap = 2 });
-        defer u.close();
-        var close_index: ?usize = null;
-        var switch_index: ?usize = null;
-        for (self.tabs.items, 0..) |t, i| {
-            const id = kit.print("tab/{d}", .{i});
-            const front = i == self.active;
-            const hovered = u.isPointerOver(id);
-            u.open(.{
-                .id = id,
-                .width = .fixed(tabWidth(self)),
-                .height = .fixed(tab_h),
-                .padding = .trbl(0, 4, 0, 12),
-                .gap = 8,
-                .align_y = .center,
-                .corner_radius = .corners(8, 8, 0, 0),
-                .background_color = if (front) toolbarColor(kit) else if (hovered) p.subtle_secondary else .transparent,
-            });
-            {
-                kit.icon(.folder, 16, if (front) p.accent_text else ink, .filled);
-                u.open(.{ .width = .grow, .clip = .both });
-                var style = kit.style(.caption, ink);
-                style.wrap = .none;
-                var buffer: [256]u8 = undefined;
-                u.text(kit.print("{s}", .{self.titleOf(t, &buffer)}), style);
-                u.close();
-                const close_id = kit.print("tab/{d}/close", .{i});
-                if (front or hovered or u.isPointerOver(close_id)) {
-                    u.open(.{
-                        .id = close_id,
-                        .width = .fixed(24),
-                        .height = .fixed(24),
-                        .align_x = .center,
-                        .align_y = .center,
-                        .corner_radius = .all(4),
-                        .background_color = if (u.isPointerOver(close_id)) p.subtle_secondary else .transparent,
-                    });
-                    kit.icon(.dismiss, 12, ink, .regular);
-                    if (u.justReleased()) close_index = i;
-                    u.close();
-                }
-                const on_close = u.isPointerOver(close_id);
-                if (u.justPressed() and !on_close) switch_index = i;
-            }
-            u.close();
-            // A middle click closes it - see `Files.pointerButton`.
-        }
-        if (kit.button("tab/new", "", .{ .kind = .subtle, .icon = .add })) self.newTab(self.tab().location);
-        kit.tooltip("tab/new", "New tab (Ctrl+T)");
-        if (switch_index) |i| self.switchTab(i);
-        if (close_index) |i| self.closeTab(i);
-    }
-    // The empty part: where the window is dragged from, and a double click
-    // maximises it.
-    u.open(.{ .id = "titlebar/drag", .width = .grow, .height = .grow });
-    if (u.justPressed()) {
-        if (window.clickCount() >= 2) window.toggleMaximized() else window.startMove();
-    }
-    u.close();
-    {
-        u.open(.{ .width = .fixed(3 * caption_w + 16), .height = .grow });
-        defer u.close();
-        const caption = kit.titleBar("title", .{
-            .title = "",
-            .height = title_h,
-            .window = .{ .active = window.activated, .maximized = window.maximized, .snapped = window.tiled },
-        });
-        switch (caption) {
-            .minimize => window.minimize(),
-            .maximize => window.toggleMaximized(),
-            .close => window.close(),
-            else => {},
-        }
-        // Resting on the maximise button: the compositor's layouts under
-        // it, as under its own.
-        if (u.isPointerOver("title/maximize") and !window.down) {
-            const now = Window.nowMs();
-            if (self.maximize_rest_ms == 0) self.maximize_rest_ms = now;
-            if (!self.layouts_shown and now - self.maximize_rest_ms >= maximize_rest_ms) {
-                self.layouts_shown = true;
-                if (window.boxOf("title/maximize")) |box| window.showLayouts(box);
-            } else if (!self.layouts_shown) window.wakeAt(self.maximize_rest_ms + maximize_rest_ms);
-        } else {
-            self.maximize_rest_ms = 0;
-            self.layouts_shown = false;
-        }
-    }
-}
-
-/// Tabs share the room as Windows' do: up to 240 wide each, at least 100.
-fn tabWidth(self: *Files) f32 {
-    const room: f32 = @as(f32, @floatFromInt(self.window.width)) - 3 * caption_w - 160;
-    const n: f32 = @floatFromInt(self.tabs.items.len);
-    return std.math.clamp(room / @max(1, n), 100, 240);
+/// What is chosen or under the pointer, Windows 10's way or 11's.
+pub fn hoverFill(kit: *Kit) Color {
+    return if (kit.theme.look.style == .win10) win10.hoverColor(kit) else kit.theme.palette.subtle_secondary;
 }
 
 // -------------------------------------------------------------------------
@@ -158,44 +53,128 @@ pub fn addressRow(self: *Files, kit: *Kit) void {
         .id = "address-row",
         .width = .grow,
         .height = .fixed(if (ten) 34 else 48),
-        .padding = .xy(if (ten) 4 else 8, if (ten) 2 else 8),
-        .gap = if (ten) 2 else 4,
+        .padding = .xy(if (ten) 6 else 8, if (ten) 5 else 8),
+        .gap = if (ten) 0 else 4,
         .align_y = .center,
         .background_color = toolbarColor(kit),
     });
     defer u.close();
-    if (navButton(kit, "nav/back", .arrow_left, t.canGoBack(), "Back (Alt+Left)", ten)) self.goBack();
-    if (navButton(kit, "nav/forward", .arrow_right, t.canGoForward(), "Forward (Alt+Right)", ten)) self.goForward();
-    if (navButton(kit, "nav/up", .arrow_up, t.parentPath() != null, "Up (Alt+Up)", ten)) self.goUp();
-    if (!ten) if (navButton(kit, "nav/refresh", .arrow_clockwise, t.path() != null, "Refresh (F5)", ten)) self.refresh();
+    if (navButton(self, kit, "nav/back", .arrow_left, t.canGoBack(), "Back (Alt+Left)")) self.goBack();
+    if (navButton(self, kit, "nav/forward", .arrow_right, t.canGoForward(), "Forward (Alt+Right)")) self.goForward();
+    // Windows 10's: the places been to lately, under a small arrow.
+    if (ten) if (navButton(self, kit, "nav/recent", .chevron_down, t.canGoBack() or t.canGoForward(), "Recent locations")) {
+        self.menu = if (self.menu == .recent) .none else .recent;
+    };
+    if (navButton(self, kit, "nav/up", .arrow_up, t.parentPath() != null or t.location == .home, "Up to the folder above (Alt+Up)")) self.goUp();
+    if (!ten) if (navButton(self, kit, "nav/refresh", .arrow_clockwise, t.path() != null, "Refresh (F5)")) self.refresh();
+    if (ten) u.empty(.{ .width = .fixed(6) });
     address(self, kit);
+    u.empty(.{ .width = .fixed(if (ten) 6 else 0) });
     {
-        u.open(.{ .width = .fixed(if (ten) 240 else 280) });
+        u.open(.{ .width = .fixed(if (ten) 220 else 280) });
         defer u.close();
         var placeholder_buffer: [256]u8 = undefined;
-        kit.textField("search/field", .{
-            .placeholder = kit.print("Search {s}", .{self.titleOf(t, &placeholder_buffer)}),
-            .width = .grow,
-            .icon = .search,
-        });
+        searchField(self, kit, kit.print("Search {s}", .{self.titleOf(t, &placeholder_buffer)}));
     }
 }
 
-fn navButton(kit: *Kit, id: []const u8, glyph: widgets.icons.Name, enabled: bool, tip: []const u8, ten: bool) bool {
+/// The search box: the address bar's twin - as tall, the same frame and
+/// type - the magnifier at its end, an ✕ to clear it while it has a
+/// search.
+fn searchField(self: *Files, kit: *Kit, placeholder: []const u8) void {
+    const u = kit.ui;
+    fieldBegin(self, kit, "search/frame", "search/field", placeholder);
+    defer u.close();
+    const value: []const u8 = u.textValueOf("search/field") orelse "";
+    const typed = value.len > 0;
+    if (fieldEnd(self, kit, "search/end", if (typed) .dismiss else .search, if (typed) 10 else 14) and typed) self.closeSearch();
+    if (u.textChanged("search/field")) self.searchChanged();
+}
+
+/// A button at a field's end: Windows 10's square, 11's rounded.
+fn fieldEnd(self: *Files, kit: *Kit, id: []const u8, glyph: widgets.icons.Name, size: u16) bool {
+    if (self.ten()) return addressEnd(kit, id, glyph, size);
     const u = kit.ui;
     const p = &kit.theme.palette;
-    const size: f32 = if (ten) 28 else 32;
+    u.open(.{ .id = id, .width = .fixed(26), .height = .fixed(24), .align_x = .center, .align_y = .center, .corner_radius = .all(4), .background_color = if (u.isPointerOver(id)) p.subtle_secondary else .transparent });
+    kit.icon(glyph, size, p.text_secondary, .regular);
+    const clicked = u.justReleased();
+    u.close();
+    return clicked;
+}
+
+/// A field as the address bar and the search box are, in either look: its
+/// frame opened - the caller adds what goes at its end and closes it -
+/// and the text in it in the address bar's type.
+fn fieldBegin(self: *Files, kit: *Kit, frame_id: []const u8, field_id: []const u8, placeholder: []const u8) void {
+    const u = kit.ui;
+    const p = &kit.theme.palette;
+    const ten = self.ten();
+    const focused = u.isFocused(field_id);
+    const hovered = u.isPointerOver(frame_id);
+    u.open(.{
+        .id = frame_id,
+        .width = .grow,
+        .height = .fixed(if (ten) address_h else 32),
+        .padding = if (ten) .trbl(0, 0, 0, 6) else .trbl(0, 4, 0, 10),
+        .gap = 2,
+        .align_y = .center,
+        .corner_radius = .all(if (ten) 0 else 4),
+        .background_color = if (ten) win10.windowColor(kit) else if (focused) p.control_input_active else if (hovered) p.control_secondary else p.control,
+        .border = .{ .color = if (ten) win10Frame(kit, focused, hovered) else p.control_stroke, .width = .all(1) },
+        .cursor = .ibeam,
+    });
+    // Windows 11's accent line along the bottom while it has the caret.
+    if (!ten and focused) u.empty(.{
+        .width = .percent(1),
+        .height = .fixed(2),
+        .background_color = p.accent,
+        .floating = .{ .attach = .parent, .fractions = .{ .element_x = 0, .element_y = 1, .target_x = 0, .target_y = 1 } },
+        .passthrough = true,
+    });
+    const caption = kit.typeOf(.caption);
+    u.textInput(.{ .id = field_id, .width = .grow, .height = .fixed(@floatFromInt(caption.line)) }, .{
+        .placeholder = placeholder,
+        .font_size = caption.size,
+        .line_height = caption.line,
+        .text_color = p.text_primary,
+        .placeholder_color = p.text_secondary,
+        .cursor_color = p.text_primary,
+        .selection_color = kit.theme.accent.base.withAlpha(0.6),
+    });
+}
+
+/// The frame of Windows 10's address bar and search box: grey, darker
+/// under the pointer, blue with the caret.
+fn win10Frame(kit: *Kit, focused: bool, hovered: bool) Color {
+    if (focused) return widgets.argb(0xFF0078D7);
+    if (hovered) return if (kit.theme.palette.mode == .dark) widgets.argb(0xFF7A7A7A) else widgets.argb(0xFFA6A6A6);
+    return win10.edgeColor(kit);
+}
+
+/// Windows 10's address bar and search box are this tall.
+const address_h = 24;
+
+fn navButton(self: *Files, kit: *Kit, id: []const u8, glyph: widgets.icons.Name, enabled: bool, tip: []const u8) bool {
+    const u = kit.ui;
+    const p = &kit.theme.palette;
+    const ten = self.ten();
+    const small = glyph == .chevron_down;
+    const size: f32 = if (ten) (if (small) 14 else 26) else 32;
     const hovered = enabled and u.isPointerOver(id);
     u.open(.{
         .id = id,
         .width = .fixed(size),
-        .height = .fixed(size),
+        .height = .fixed(if (ten) 24 else 32),
         .align_x = .center,
         .align_y = .center,
-        .corner_radius = .all(4),
-        .background_color = if (enabled and u.isElementPressed(id)) p.subtle_tertiary else if (hovered) p.subtle_secondary else .transparent,
+        .corner_radius = .all(if (ten) 0 else 4),
+        .background_color = if (ten) .transparent else if (enabled and u.isElementPressed(id)) p.subtle_tertiary else if (hovered) p.subtle_secondary else .transparent,
     });
-    kit.icon(glyph, 16, if (enabled) p.text_primary else p.text_disabled, .regular);
+    // Windows 10's arrows turn blue under the pointer rather than lighting
+    // a plate.
+    const colour = if (!enabled) p.text_disabled else if (ten and hovered) widgets.argb(0xFF1979CA) else if (ten) p.text_secondary else p.text_primary;
+    kit.icon(glyph, if (small) 10 else 16, colour, .regular);
     const clicked = enabled and u.justReleased();
     u.close();
     if (enabled) kit.tooltip(id, tip);
@@ -210,9 +189,21 @@ fn address(self: *Files, kit: *Kit) void {
     const t = self.tab();
     const ten = self.ten();
     if (self.editing_address) {
-        u.open(.{ .width = .grow });
+        fieldBegin(self, kit, "address/frame", "address/field", "");
         defer u.close();
-        kit.textField("address/field", .{ .width = .grow });
+        if (ten) {
+            _ = addressEnd(kit, "address/history", .chevron_down, 10);
+            u.empty(.{ .width = .fixed(1), .height = .grow, .background_color = win10.edgeColor(kit) });
+        }
+        _ = fieldEnd(self, kit, "address/go", .arrow_right, 14);
+        // Go to: on the press - the field has lost the caret by the release.
+        if (u.justPressed() and u.isPointerOver("address/go")) {
+            const typed: []const u8 = u.textValueOf("address/field") orelse "";
+            var buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const copy = std.fmt.bufPrint(&buffer, "{s}", .{typed}) catch return;
+            self.editing_address = false;
+            return self.goToTyped(copy);
+        }
         // The path put in, chosen, once the field is there - a value set
         // before it is would be lost.
         if (self.address_draws < 3) {
@@ -237,73 +228,122 @@ fn address(self: *Files, kit: *Kit) void {
     u.open(.{
         .id = id,
         .width = .grow,
-        .height = .fixed(if (ten) 26 else 32),
-        .padding = .xy(8, 0),
-        .gap = 2,
+        .height = .fixed(if (ten) address_h else 32),
+        .padding = .trbl(0, 0, 0, if (ten) 4 else 8),
+        .gap = 0,
         .align_y = .center,
         .corner_radius = .all(if (ten) 0 else 4),
-        .background_color = if (ten) p.solid_base else p.control,
-        .border = .{ .color = p.control_stroke, .width = .all(1) },
+        .background_color = if (ten) win10.windowColor(kit) else p.control,
+        .border = .{ .color = if (ten) win10Frame(kit, false, u.isPointerOver(id)) else p.control_stroke, .width = .all(1) },
         .clip = .both,
     });
     defer u.close();
     var to: ?Tab.Location = null;
     var to_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    kit.icon(switch (t.location) {
-        .home => .home,
-        .this_pc => .desktop,
-        .folder => .folder,
-    }, 16, p.text_secondary, .regular);
-    crumbSeparator(kit);
+    switch (t.location) {
+        // A folder's own picture, as Windows puts it at the start.
+        .folder => |path| icons.themed(self, kit, if (std.mem.eql(u8, path, "/")) "drive-harddisk" else icons.special(self.places.specialOf(path)), 16),
+        .trash => icons.themed(self, kit, "user-trash", 16),
+        else => kit.icon(switch (t.location) {
+            .home => if (ten) .star else .home,
+            .this_pc => .desktop,
+            else => .search,
+        }, 16, if (ten and t.location == .home) widgets.argb(0xFF2B88D8) else p.text_secondary, if (ten and t.location == .home) .filled else .regular),
+    }
+    crumbSeparator(self, kit, "crumb/sep/root", "");
     switch (t.location) {
         .home => {
-            if (crumb(kit, "crumb/home", if (ten) "Quick access" else "Home")) to = .home;
+            if (crumb(self, kit, "crumb/home", if (ten) "Quick access" else "Home")) to = .home;
         },
         .this_pc => {
-            if (crumb(kit, "crumb/pc", "This PC")) to = .this_pc;
+            if (crumb(self, kit, "crumb/pc", "This PC")) to = .this_pc;
+        },
+        .trash => {
+            if (crumb(self, kit, "crumb/trash", "Recycle Bin")) to = .trash;
+        },
+        .search => |q| {
+            var style = kit.style(.caption, p.text_primary);
+            style.wrap = .none;
+            u.text(kit.print("Search results in {s}", .{std.fs.path.basename(q.folder)}), style);
         },
         .folder => |path| {
-            // Under the home folder: from it, as Windows starts from the
-            // person's folder; elsewhere from This PC and the drive.
+            // In a person's folder: from it - after This PC in Windows 10,
+            // on its own in 11, as Windows shows its known folders. Under
+            // the home folder: from it. Elsewhere from This PC and the
+            // drive.
             const home = self.places.home;
-            const under_home = std.mem.startsWith(u8, path, home) and (path.len == home.len or path[home.len] == '/');
             var start: usize = 0;
-            if (under_home) {
+            var root: []const u8 = "/";
+            if (self.knownFolderOf(path)) |known| {
+                start = known.path.len;
+                root = known.path;
+                if (ten) {
+                    if (crumb(self, kit, "crumb/pc", "This PC")) to = .this_pc;
+                    crumbSeparator(self, kit, "crumb/sep/pc", "");
+                }
+                if (crumb(self, kit, "crumb/root", known.name)) to = .{ .folder = known.path };
+            } else if (within(path, home)) {
                 start = home.len;
-                if (crumb(kit, "crumb/root", std.fs.path.basename(home))) to = .{ .folder = home };
+                root = home;
+                if (crumb(self, kit, "crumb/root", std.fs.path.basename(home))) to = .{ .folder = home };
             } else {
-                if (crumb(kit, "crumb/pc", "This PC")) to = .this_pc;
-                crumbSeparator(kit);
-                if (crumb(kit, "crumb/root", "Local Disk (/)")) to = .{ .folder = "/" };
+                if (crumb(self, kit, "crumb/pc", "This PC")) to = .this_pc;
+                crumbSeparator(self, kit, "crumb/sep/pc", "");
+                if (crumb(self, kit, "crumb/root", self.places.rootName())) to = .{ .folder = "/" };
             }
             var parts = std.mem.tokenizeScalar(u8, path[start..], '/');
             var n: usize = 0;
+            var before: []const u8 = root;
             while (parts.next()) |part| : (n += 1) {
-                crumbSeparator(kit);
-                if (crumb(kit, kit.print("crumb/{d}", .{n}), part)) {
-                    const end = @intFromPtr(part.ptr) - @intFromPtr(path.ptr) + part.len;
+                crumbSeparator(self, kit, kit.print("crumb/sep/{d}", .{n}), before);
+                const end = @intFromPtr(part.ptr) - @intFromPtr(path.ptr) + part.len;
+                if (crumb(self, kit, kit.print("crumb/{d}", .{n}), part)) {
                     to = .{ .folder = std.fmt.bufPrint(&to_buffer, "{s}", .{path[0..end]}) catch path };
                 }
+                before = path[0..end];
             }
+            // The last one's "›" too: the folders in the one shown.
+            crumbSeparator(self, kit, "crumb/sep/last", path);
         },
     }
     // The empty part: the path to type.
     u.open(.{ .id = "address/empty", .width = .grow, .height = .grow });
     if (u.justReleased()) self.editAddress();
     u.close();
+    // Windows 10's: the address's history, and refresh, at its end.
+    if (ten) {
+        _ = addressEnd(kit, "address/history", .chevron_down, 10);
+        u.empty(.{ .width = .fixed(1), .height = .grow, .background_color = win10.edgeColor(kit) });
+        if (addressEnd(kit, "address/refresh", .arrow_clockwise, 14)) self.refresh();
+        kit.tooltip("address/refresh", "Refresh (F5)");
+    }
     if (to) |where| self.goTo(where);
 }
 
-fn crumb(kit: *Kit, id: []const u8, text: []const u8) bool {
+fn addressEnd(kit: *Kit, id: []const u8, glyph: widgets.icons.Name, size: u16) bool {
+    const u = kit.ui;
+    u.open(.{ .id = id, .width = .fixed(22), .height = .grow, .align_x = .center, .align_y = .center, .background_color = if (u.isPointerOver(id)) win10.hoverColor(kit) else .transparent });
+    kit.icon(glyph, size, kit.theme.palette.text_secondary, .regular);
+    const clicked = u.justReleased();
+    u.close();
+    return clicked;
+}
+
+fn crumb(self: *Files, kit: *Kit, id: []const u8, text: []const u8) bool {
     const u = kit.ui;
     const p = &kit.theme.palette;
+    const ten = self.ten();
+    const hovered = u.isPointerOver(id);
     u.open(.{
         .id = id,
-        .padding = .xy(6, 3),
-        .corner_radius = .all(4),
-        .background_color = if (u.isElementPressed(id)) p.subtle_tertiary else if (u.isPointerOver(id)) p.subtle_secondary else .transparent,
+        .height = .fixed(if (ten) 22 else 26),
+        .padding = .xy(if (ten) 4 else 6, 0),
+        .align_y = .center,
+        .corner_radius = .all(if (ten) 0 else 4),
+        .background_color = if (u.isElementPressed(id)) (if (ten) win10.pressColor(kit) else p.subtle_tertiary) else if (hovered) hoverFill(kit) else .transparent,
+        .border = if (ten and hovered) .{ .color = win10.hoverEdge(kit), .width = .all(1) } else .{},
     });
-    var style = kit.style(.body, p.text_primary);
+    var style = kit.style(.caption, p.text_primary);
     style.wrap = .none;
     u.text(text, style);
     const clicked = u.justReleased();
@@ -311,251 +351,87 @@ fn crumb(kit: *Kit, id: []const u8, text: []const u8) bool {
     return clicked;
 }
 
-fn crumbSeparator(kit: *Kit) void {
-    kit.icon(.chevron_right, 12, kit.theme.palette.text_secondary, .regular);
+/// Whether `path` is `folder` or inside it.
+fn within(path: []const u8, folder: []const u8) bool {
+    return std.mem.startsWith(u8, path, folder) and (path.len == folder.len or path[folder.len] == '/');
 }
 
-// -------------------------------------------------------------------------
-// Windows 11's command bar
-// -------------------------------------------------------------------------
-
-pub fn commandBar(self: *Files, kit: *Kit) void {
+/// A "›" between crumbs: clicked, the folders in `folder` - the crumb
+/// before it - to go to, "˅" while they are shown. The first, with no
+/// folder, lists the places.
+fn crumbSeparator(self: *Files, kit: *Kit, id: []const u8, folder: []const u8) void {
     const u = kit.ui;
     const p = &kit.theme.palette;
-    const t = self.tab();
-    const in_folder = t.path() != null;
-    const chosen = t.selectedCount() > 0;
-    u.open(.{
-        .id = "commandbar",
-        .width = .grow,
-        .height = .fixed(48),
-        .padding = .xy(12, 6),
-        .gap = 4,
-        .align_y = .center,
-        .background_color = toolbarColor(kit),
-        .border = .{ .color = p.divider, .width = .{ .bottom = 1 } },
-    });
-    defer u.close();
-    if (menuButton(kit, "cmd/new", .add, "New", in_folder)) self.menu = if (self.menu == .new) .none else .new;
-    divider(kit);
-    if (commandButton(kit, "cmd/cut", .cut, "Cut (Ctrl+X)", chosen)) actions.copy(self, true);
-    if (commandButton(kit, "cmd/copy", .copy, "Copy (Ctrl+C)", chosen)) actions.copy(self, false);
-    if (commandButton(kit, "cmd/paste", .clipboard_paste, "Paste (Ctrl+V)", actions.canPaste(self))) actions.paste(self);
-    if (commandButton(kit, "cmd/rename", .rename, "Rename (F2)", t.selectedCount() == 1)) if (t.current()) |i| self.startRename(i);
-    _ = commandButton(kit, "cmd/share", .share, "Share", false);
-    if (commandButton(kit, "cmd/delete", .delete, "Delete (Del)", chosen)) actions.delete(self, false);
-    divider(kit);
-    if (menuButton(kit, "cmd/sort", .arrow_sort, "Sort", in_folder)) self.menu = if (self.menu == .sort) .none else .sort;
-    if (menuButton(kit, "cmd/view", .grid, "View", true)) self.menu = if (self.menu == .view) .none else .view;
-    if (commandButton(kit, "cmd/more", .more_horizontal, "See more", true)) self.menu = if (self.menu == .more) .none else .more;
-    u.empty(.{ .width = .grow });
-}
-
-fn divider(kit: *Kit) void {
-    kit.ui.empty(.{ .width = .fixed(1), .height = .fixed(24), .background_color = kit.theme.palette.divider });
-}
-
-/// A command's icon - its name a tooltip - as Windows 11's command bar has
-/// them.
-fn commandButton(kit: *Kit, id: []const u8, glyph: widgets.icons.Name, name: []const u8, enabled: bool) bool {
-    const u = kit.ui;
-    const p = &kit.theme.palette;
-    const hovered = enabled and u.isPointerOver(id);
+    const ten = self.ten();
+    const open = self.menu == .crumb and std.mem.eql(u8, self.crumb_anchor_buffer[0..self.crumb_anchor_len], id);
+    const hovered = u.isPointerOver(id);
     u.open(.{
         .id = id,
-        .width = .fixed(40),
-        .height = .fixed(36),
+        .width = .fixed(if (ten) 16 else 18),
+        .height = .fixed(if (ten) 22 else 26),
         .align_x = .center,
         .align_y = .center,
-        .corner_radius = .all(4),
-        .background_color = if (enabled and u.isElementPressed(id)) p.subtle_tertiary else if (hovered) p.subtle_secondary else .transparent,
+        .corner_radius = .all(if (ten) 0 else 4),
+        .background_color = if (open) (if (ten) win10.pressColor(kit) else p.subtle_tertiary) else if (hovered) hoverFill(kit) else .transparent,
+        .border = if (ten and (hovered or open)) .{ .color = win10.hoverEdge(kit), .width = .all(1) } else .{},
     });
-    kit.icon(glyph, 20, if (enabled) p.text_primary else p.text_disabled, .regular);
-    const clicked = enabled and u.justReleased();
+    kit.icon(if (open) .chevron_down else .chevron_right, 10, p.text_secondary, .regular);
+    const clicked = u.justReleased();
     u.close();
-    kit.tooltip(id, name);
-    return clicked;
+    if (!clicked) return;
+    if (open) {
+        self.menu = .none;
+        return;
+    }
+    if (self.crumb_list) |l| l.free(self.gpa);
+    self.crumb_list = if (folder.len > 0) nav.readFolders(self, folder) else null;
+    self.crumb_anchor_len = @min(id.len, self.crumb_anchor_buffer.len);
+    @memcpy(self.crumb_anchor_buffer[0..self.crumb_anchor_len], id[0..self.crumb_anchor_len]);
+    self.menu = .crumb;
 }
 
-/// A command with words and a "˅": New, Sort, View.
-fn menuButton(kit: *Kit, id: []const u8, glyph: widgets.icons.Name, name: []const u8, enabled: bool) bool {
-    const u = kit.ui;
-    const p = &kit.theme.palette;
-    const hovered = enabled and u.isPointerOver(id);
-    u.open(.{
-        .id = id,
-        .height = .fixed(36),
-        .padding = .xy(10, 0),
-        .gap = 8,
-        .align_y = .center,
-        .corner_radius = .all(4),
-        .background_color = if (enabled and u.isElementPressed(id)) p.subtle_tertiary else if (hovered) p.subtle_secondary else .transparent,
-    });
-    const ink = if (enabled) p.text_primary else p.text_disabled;
-    kit.icon(glyph, 20, if (enabled and glyph == .add) p.accent_text else ink, .regular);
-    var style = kit.style(.body, ink);
-    style.wrap = .none;
-    u.text(name, style);
-    kit.icon(.chevron_down, 12, ink, .regular);
-    const clicked = enabled and u.justReleased();
-    u.close();
-    return clicked;
-}
-
-// -------------------------------------------------------------------------
-// Windows 10's ribbon
-// -------------------------------------------------------------------------
-
-pub fn ribbon(self: *Files, kit: *Kit) void {
-    const u = kit.ui;
-    const p = &kit.theme.palette;
-    const t = self.tab();
-    const chosen = t.selectedCount() > 0;
-    // The tabs' names: File in the accent, then Home, Share, View.
-    {
-        u.open(.{ .width = .grow, .height = .fixed(24), .align_y = .center, .background_color = p.solid_base });
-        defer u.close();
-        u.open(.{ .height = .grow, .padding = .xy(14, 0), .align_y = .center, .background_color = p.accent });
-        kit.label("File", .body, p.text_on_accent);
-        u.close();
-        for ([_][]const u8{ "Home", "Share", "View" }, 0..) |name, i| {
-            const id = kit.print("ribbon/tab/{d}", .{i});
-            const front = i == 0;
-            u.open(.{
-                .id = id,
-                .height = .grow,
-                .padding = .xy(12, 0),
-                .align_y = .center,
-                .background_color = if (front) toolbarColor(kit) else if (u.isPointerOver(id)) p.subtle_secondary else .transparent,
-                .border = if (front) .{ .color = p.divider, .width = .{ .left = 1, .right = 1, .top = 1 } } else .{},
-            });
-            kit.label(name, .body, p.text_primary);
-            u.close();
+/// The folders a "›" opened, or the places for the first.
+fn crumbMenu(self: *Files, kit: *Kit) void {
+    const anchor = self.crumb_anchor_buffer[0..self.crumb_anchor_len];
+    if (closeOnPressOutside(self, kit, "menu/crumb", &.{anchor})) return;
+    menus_mod.begin(self, kit, "menu/crumb", .{ .attach = .id, .to = anchor, .fractions = .{ .element_x = 0, .element_y = 0, .target_x = 0, .target_y = 1 }, .z_index = 50 });
+    defer menus_mod.end(kit);
+    const list = self.crumb_list orelse {
+        // The places, as the first "›" lists the desktop's.
+        if (menus_mod.row(self, kit, "menu/crumb/home", if (self.ten()) "Quick access" else "Home", .{ .icon = if (self.ten()) .star else .home })) {
+            close(self);
+            return self.goTo(.home);
         }
-    }
-    u.open(.{
-        .id = "ribbon",
-        .width = .grow,
-        .height = .fixed(92),
-        .padding = .xy(4, 4),
-        .gap = 0,
-        .background_color = toolbarColor(kit),
-        .border = .{ .color = p.divider, .width = .{ .top = 1, .bottom = 1 } },
-    });
-    defer u.close();
-    {
-        ribbonGroupBegin(kit, "Clipboard");
-        defer ribbonGroupEnd(kit, "Clipboard");
-        _ = ribbonLarge(kit, "ribbon/pin", .pin, "Pin to Quick\naccess", false);
-        if (ribbonLarge(kit, "ribbon/copy", .copy, "Copy", chosen)) actions.copy(self, false);
-        if (ribbonLarge(kit, "ribbon/paste", .clipboard_paste, "Paste", actions.canPaste(self))) actions.paste(self);
-        {
-            u.open(.{ .direction = .top_to_bottom, .gap = 2, .padding = .xy(2, 2) });
-            defer u.close();
-            if (ribbonSmall(kit, "ribbon/cut", .cut, "Cut", chosen)) actions.copy(self, true);
-            if (ribbonSmall(kit, "ribbon/copy-path", .clipboard_paste, "Copy path", true)) actions.copyAsPath(self);
+        for (self.places.user.items, 0..) |f, i| if (menus_mod.row(self, kit, kit.print("menu/crumb/user/{d}", .{i}), f.name, .{ .themed = icons.special(f.special) })) {
+            close(self);
+            var buffer: [std.fs.max_path_bytes]u8 = undefined;
+            return self.goTo(.{ .folder = std.fmt.bufPrint(&buffer, "{s}", .{f.path}) catch return });
+        };
+        if (menus_mod.row(self, kit, "menu/crumb/pc", "This PC", .{ .icon = .desktop })) {
+            close(self);
+            return self.goTo(.this_pc);
         }
+        if (menus_mod.row(self, kit, "menu/crumb/trash", "Recycle Bin", .{ .themed = "user-trash" })) {
+            close(self);
+            return self.goTo(.trash);
+        }
+        return;
+    };
+    if (list.children.len == 0) {
+        _ = menus_mod.row(self, kit, "menu/crumb/empty", "No folders", .{ .disabled = true });
+        return;
     }
-    {
-        ribbonGroupBegin(kit, "Organise");
-        defer ribbonGroupEnd(kit, "Organise");
-        if (ribbonLarge(kit, "ribbon/delete", .delete, "Delete", chosen)) actions.delete(self, false);
-        if (ribbonLarge(kit, "ribbon/rename", .rename, "Rename", t.selectedCount() == 1)) if (t.current()) |i| self.startRename(i);
+    const here = self.tab().path() orelse "";
+    for (list.children, 0..) |child, i| {
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const full = std.fmt.bufPrint(&buffer, "{s}/{s}", .{ if (std.mem.eql(u8, list.path, "/")) "" else list.path, child }) catch continue;
+        // The one on the way to what is shown, in bold, as Windows marks it.
+        if (menus_mod.row(self, kit, kit.print("menu/crumb/{d}", .{i}), child, .{ .themed = icons.special(self.places.specialOf(full)), .strong = within(here, full) })) {
+            close(self);
+            return self.goTo(.{ .folder = full });
+        }
+        if (i >= 200) break;
     }
-    {
-        ribbonGroupBegin(kit, "New");
-        defer ribbonGroupEnd(kit, "New");
-        if (ribbonLarge(kit, "ribbon/new-folder", .folder, "New\nfolder", t.path() != null)) actions.newFolder(self);
-    }
-    {
-        ribbonGroupBegin(kit, "Open");
-        defer ribbonGroupEnd(kit, "Open");
-        if (ribbonLarge(kit, "ribbon/open", .open, "Open", t.selectedCount() == 1)) if (t.current()) |i| self.open(i, false);
-    }
-    {
-        ribbonGroupBegin(kit, "Select");
-        defer ribbonGroupEnd(kit, "Select");
-        u.open(.{ .direction = .top_to_bottom, .gap = 2, .padding = .xy(4, 2) });
-        defer u.close();
-        if (ribbonSmall(kit, "ribbon/select-all", .checkmark, "Select all", t.count() > 0)) t.selectAll();
-        if (ribbonSmall(kit, "ribbon/select-none", .dismiss, "Select none", chosen)) t.selectNone();
-        if (ribbonSmall(kit, "ribbon/invert", .arrow_sync, "Invert selection", t.count() > 0)) t.invertSelection();
-    }
-}
-
-fn ribbonGroupBegin(kit: *Kit, _: []const u8) void {
-    const u = kit.ui;
-    u.open(.{ .height = .grow, .direction = .top_to_bottom, .padding = .xy(2, 0), .border = .{ .color = kit.theme.palette.divider, .width = .{ .right = 1 } } });
-    u.open(.{ .height = .grow, .gap = 2 });
-}
-
-fn ribbonGroupEnd(kit: *Kit, name: []const u8) void {
-    const u = kit.ui;
-    u.close();
-    u.open(.{ .width = .grow, .align_x = .center });
-    kit.label(name, .caption, kit.theme.palette.text_secondary);
-    u.close();
-    u.close();
-}
-
-/// A large ribbon button: a 32 px glyph over its name.
-fn ribbonLarge(kit: *Kit, id: []const u8, glyph: widgets.icons.Name, name: []const u8, enabled: bool) bool {
-    const u = kit.ui;
-    const p = &kit.theme.palette;
-    const hovered = enabled and u.isPointerOver(id);
-    u.open(.{
-        .id = id,
-        .height = .grow,
-        .direction = .top_to_bottom,
-        .padding = .xy(6, 2),
-        .gap = 2,
-        .align_x = .center,
-        .background_color = if (enabled and u.isElementPressed(id)) argbWin10Pressed(kit) else if (hovered) argbWin10Hover(kit) else .transparent,
-        .border = if (hovered) .{ .color = argbWin10Edge(kit), .width = .all(1) } else .{},
-    });
-    kit.icon(glyph, 28, if (enabled) p.accent_text else p.text_disabled, .regular);
-    var style = kit.style(.caption, if (enabled) p.text_primary else p.text_disabled);
-    style.alignment = .center;
-    u.text(name, style);
-    const clicked = enabled and u.justReleased();
-    u.close();
-    return clicked;
-}
-
-fn ribbonSmall(kit: *Kit, id: []const u8, glyph: widgets.icons.Name, name: []const u8, enabled: bool) bool {
-    const u = kit.ui;
-    const p = &kit.theme.palette;
-    const hovered = enabled and u.isPointerOver(id);
-    u.open(.{
-        .id = id,
-        .height = .fixed(22),
-        .padding = .xy(4, 0),
-        .gap = 6,
-        .align_y = .center,
-        .background_color = if (enabled and u.isElementPressed(id)) argbWin10Pressed(kit) else if (hovered) argbWin10Hover(kit) else .transparent,
-        .border = if (hovered) .{ .color = argbWin10Edge(kit), .width = .all(1) } else .{},
-    });
-    kit.icon(glyph, 16, if (enabled) p.accent_text else p.text_disabled, .regular);
-    var style = kit.style(.caption, if (enabled) p.text_primary else p.text_disabled);
-    style.wrap = .none;
-    u.text(name, style);
-    const clicked = enabled and u.justReleased();
-    u.close();
-    return clicked;
-}
-
-/// Windows 10's ribbon buttons: light blue under the pointer, a deeper blue
-/// pressed - in dark mode, greys.
-fn argbWin10Hover(kit: *Kit) Color {
-    return if (kit.theme.palette.mode == .dark) widgets.argb(0xFF3E3E3E) else widgets.argb(0xFFE5F3FF);
-}
-
-fn argbWin10Pressed(kit: *Kit) Color {
-    return if (kit.theme.palette.mode == .dark) widgets.argb(0xFF4D4D4D) else widgets.argb(0xFFCCE8FF);
-}
-
-fn argbWin10Edge(kit: *Kit) Color {
-    return if (kit.theme.palette.mode == .dark) widgets.argb(0xFF5A5A5A) else widgets.argb(0xFFCCE8FF);
 }
 
 // -------------------------------------------------------------------------
@@ -571,48 +447,58 @@ pub fn statusBar(self: *Files, kit: *Kit) void {
         .id = "statusbar",
         .width = .grow,
         .height = .fixed(if (ten) 22 else 26),
-        .padding = .xy(12, 0),
-        .gap = 16,
+        .padding = .xy(if (ten) 4 else 12, 0),
+        .gap = if (ten) 12 else 8,
         .align_y = .center,
         .background_color = contentColor(kit),
     });
     defer u.close();
     var style = kit.style(.caption, p.text_primary);
     style.wrap = .none;
-    if (t.path() != null) {
+    if (t.path() != null or t.location == .trash or t.location == .search) {
         const n = t.count();
         u.text(kit.print("{d} item{s}", .{ n, if (n == 1) "" else "s" }), style);
         const chosen = t.selectedCount();
         if (chosen > 0) {
-            u.empty(.{ .width = .fixed(1), .height = .fixed(12), .background_color = p.divider });
+            separator(self, kit);
             var size_buffer: [32]u8 = undefined;
             const size = t.selectedSize();
             if (size > 0) {
                 u.text(kit.print("{d} item{s} selected  {s}", .{ chosen, if (chosen == 1) "" else "s", Folder.sizeText(size, &size_buffer) }), style);
             } else u.text(kit.print("{d} item{s} selected", .{ chosen, if (chosen == 1) "" else "s" }), style);
         }
-        if (t.folder) |f| if (f.failure) |err| {
-            var failed = kit.style(.caption, p.critical);
-            failed.wrap = .none;
-            u.text(kit.print("Could not read this folder: {t}", .{err}), failed);
-        };
+        if (!ten and n > 0) separator(self, kit);
+        if (self.searching()) {
+            separator(self, kit);
+            u.text("Searching…", style);
+        }
+    } else if (t.location == .this_pc) {
+        u.text(kit.print("{d} items", .{self.places.drives.items.len + if (ten) self.places.user.items.len else 0}), style);
     }
     u.empty(.{ .width = .grow });
-    if (viewToggle(kit, "status/details", .text_bullet_list, t.view == .details, "Details")) self.setView(.details);
-    if (viewToggle(kit, "status/icons", .grid, t.view == .large, "Large icons")) self.setView(.large);
+    if (viewToggle(self, kit, "status/details", .text_bullet_list, t.view == .details, "Displays information about each item in the window. (Ctrl+Shift+6)")) self.setView(.details);
+    if (viewToggle(self, kit, "status/icons", .grid, t.view == .large, "Displays items by using large thumbnails. (Ctrl+Shift+2)")) self.setView(.large);
 }
 
-fn viewToggle(kit: *Kit, id: []const u8, glyph: widgets.icons.Name, on: bool, tip: []const u8) bool {
+fn separator(self: *Files, kit: *Kit) void {
+    if (self.ten()) return;
+    kit.ui.empty(.{ .width = .fixed(1), .height = .fixed(14), .background_color = kit.theme.palette.divider });
+}
+
+fn viewToggle(self: *Files, kit: *Kit, id: []const u8, glyph: widgets.icons.Name, on: bool, tip: []const u8) bool {
     const u = kit.ui;
     const p = &kit.theme.palette;
+    const ten = self.ten();
+    const hovered = u.isPointerOver(id);
     u.open(.{
         .id = id,
-        .width = .fixed(24),
-        .height = .fixed(20),
+        .width = .fixed(if (ten) 22 else 24),
+        .height = .fixed(if (ten) 18 else 20),
         .align_x = .center,
         .align_y = .center,
-        .corner_radius = .all(3),
-        .background_color = if (on) p.subtle_tertiary else if (u.isPointerOver(id)) p.subtle_secondary else .transparent,
+        .corner_radius = .all(if (ten) 0 else 3),
+        .background_color = if (on) (if (ten) win10.pressColor(kit) else p.subtle_tertiary) else if (hovered) hoverFill(kit) else .transparent,
+        .border = if (ten and (on or hovered)) .{ .color = win10.hoverEdge(kit), .width = .all(1) } else .{},
     });
     kit.icon(glyph, 14, p.text_primary, .regular);
     const clicked = u.justReleased();
@@ -622,69 +508,86 @@ fn viewToggle(kit: *Kit, id: []const u8, glyph: widgets.icons.Name, on: bool, ti
 }
 
 // -------------------------------------------------------------------------
-// The menus the command bar opens
+// The menus the command bar and the ribbon open
 // -------------------------------------------------------------------------
 
 pub fn menus(self: *Files, kit: *Kit) void {
     switch (self.menu) {
-        .none => {},
+        .none => if (self.context_open == null) {
+            self.context_sub = .none;
+        },
         .view => viewMenu(self, kit),
         .sort => sortMenu(self, kit),
+        .group => groupMenu(self, kit),
         .more => moreMenu(self, kit),
         .new => newMenu(self, kit),
+        .file => win10.fileMenu(self, kit),
+        .move_to, .copy_to => placesMenu(self, kit),
+        .recent => recentMenu(self, kit),
+        .tab => win11.tabMenu(self, kit),
+        .crumb => crumbMenu(self, kit),
     }
 }
 
-fn under(id: []const u8) ui.layout.Floating {
+/// Under the button that opened it, whichever look's it is.
+fn under(self: *Files, kit: *Kit, eleven: []const u8, ten: []const u8) ui.layout.Floating {
+    const id = if (self.ten()) ten else eleven;
+    _ = kit;
     return .{
         .attach = .id,
         .to = id,
         .fractions = .{ .element_x = 0, .element_y = 0, .target_x = 0, .target_y = 1 },
-        .offset = .{ .x = 0, .y = 4 },
+        .offset = .{ .x = 0, .y = if (self.ten()) 0 else 4 },
         .z_index = 50,
     };
 }
 
-/// A press anywhere but on the menu or its button closes it.
-fn closeOnPressOutside(self: *Files, kit: *Kit, menu_id: []const u8, button_id: []const u8) void {
+/// A press anywhere but on the menu or what opened it closes it.
+fn closeOnPressOutside(self: *Files, kit: *Kit, menu_id: []const u8, buttons: []const []const u8) bool {
     const u = kit.ui;
-    if (self.window.down and !u.isPointerOver(menu_id) and !u.isPointerOver(button_id)) self.menu = .none;
+    if (!self.window.down or u.isPointerOver(menu_id) or u.isPointerOver("context/sub")) return false;
+    for (buttons) |b| if (u.isPointerOver(b)) return false;
+    self.menu = .none;
+    return true;
 }
 
 fn viewMenu(self: *Files, kit: *Kit) void {
-    closeOnPressOutside(self, kit, "menu/view", "cmd/view");
-    kit.menuBegin("menu/view", under("cmd/view"));
-    defer kit.menuEnd();
+    if (closeOnPressOutside(self, kit, "menu/view", &.{ "cmd/view", "context" })) return;
+    menus_mod.begin(self, kit, "menu/view", under(self, kit, "cmd/view", "ribbon/tab/view"));
+    defer menus_mod.end(kit);
     const t = self.tab();
-    const items = [_]struct { view: Tab.View, name: []const u8, keys: []const u8 }{
-        .{ .view = .extra_large, .name = "Extra large icons", .keys = "Ctrl+Shift+1" },
-        .{ .view = .large, .name = "Large icons", .keys = "Ctrl+Shift+2" },
-        .{ .view = .medium, .name = "Medium icons", .keys = "Ctrl+Shift+3" },
-        .{ .view = .small, .name = "Small icons", .keys = "Ctrl+Shift+4" },
-        .{ .view = .list, .name = "List", .keys = "Ctrl+Shift+5" },
-        .{ .view = .details, .name = "Details", .keys = "Ctrl+Shift+6" },
-        .{ .view = .tiles, .name = "Tiles", .keys = "Ctrl+Shift+7" },
-        .{ .view = .content, .name = "Content", .keys = "Ctrl+Shift+8" },
-    };
-    for (items) |item| {
-        if (kit.menuItem(kit.print("menu/view/{t}", .{item.view}), item.name, .{ .icon = if (t.view == item.view) .checkmark else null, .shortcut = item.keys })) self.setView(item.view);
+    const ten = self.ten();
+    for (menus_mod.view_names, 0..) |name, i| {
+        const view: Tab.View = @enumFromInt(i);
+        if (menus_mod.row(self, kit, kit.print("menu/view/{t}", .{view}), name, .{ .marked = t.view == view, .icon = if (ten) null else menus_mod.view_glyphs[i], .shortcut = kit.print("Ctrl+Shift+{d}", .{i + 1}) })) {
+            self.setView(view);
+            return close(self);
+        }
     }
-    kit.menuSeparator();
-    if (kit.menuItem("menu/view/hidden", "Hidden items", .{ .icon = if (self.show_hidden) .checkmark else null })) {
-        self.show_hidden = !self.show_hidden;
-        for (self.tabs.items) |each| each.refilter(self.show_hidden);
-        self.menu = .none;
+    menus_mod.separator(self, kit);
+    if (!ten) {
+        if (menus_mod.row(self, kit, "menu/view/compact", "Compact view", .{ .marked = self.compact, .ticked = true, .icon = .list })) {
+            self.compact = !self.compact;
+            return close(self);
+        }
+        menus_mod.separator(self, kit);
+        // Windows 11 keeps the panes and the rest under Show.
+        menus_mod.subRowMarked(self, kit, "menu/view/show", "Show", .eye, .show, false, false);
+        return;
     }
-    if (kit.menuItem("menu/view/extensions", "File name extensions", .{ .icon = if (self.show_extensions) .checkmark else null })) {
-        self.show_extensions = !self.show_extensions;
-        self.menu = .none;
-    }
+    menus_mod.showMenu(self, kit);
+}
+
+fn close(self: *Files) void {
+    self.menu = .none;
+    self.context_sub = .none;
+    self.window.redraw();
 }
 
 fn sortMenu(self: *Files, kit: *Kit) void {
-    closeOnPressOutside(self, kit, "menu/sort", "cmd/sort");
-    kit.menuBegin("menu/sort", under("cmd/sort"));
-    defer kit.menuEnd();
+    if (closeOnPressOutside(self, kit, "menu/sort", &.{ "cmd/sort", "ribbon/sort", "context" })) return;
+    menus_mod.begin(self, kit, "menu/sort", under(self, kit, "cmd/sort", "ribbon/sort"));
+    defer menus_mod.end(kit);
     const t = self.tab();
     const items = [_]struct { by: Folder.Column, name: []const u8 }{
         .{ .by = .name, .name = "Name" },
@@ -693,45 +596,163 @@ fn sortMenu(self: *Files, kit: *Kit) void {
         .{ .by = .size, .name = "Size" },
     };
     for (items) |item| {
-        if (kit.menuItem(kit.print("menu/sort/{t}", .{item.by}), item.name, .{ .icon = if (t.sort_by == item.by) .checkmark else null })) {
-            if (t.sort_by != item.by) t.sortBy(item.by, &self.mime, self.show_hidden);
-            self.menu = .none;
+        if (menus_mod.row(self, kit, kit.print("menu/sort/{t}", .{item.by}), item.name, .{ .marked = t.sort_by == item.by })) {
+            if (t.sort_by != item.by) self.sortBy(item.by);
+            return close(self);
         }
     }
-    kit.menuSeparator();
-    if (kit.menuItem("menu/sort/ascending", "Ascending", .{ .icon = if (t.ascending) .checkmark else null })) {
-        if (!t.ascending) t.sortBy(t.sort_by, &self.mime, self.show_hidden);
-        self.menu = .none;
+    menus_mod.separator(self, kit);
+    if (menus_mod.row(self, kit, "menu/sort/ascending", "Ascending", .{ .marked = t.ascending })) {
+        self.sortOrder(true);
+        return close(self);
     }
-    if (kit.menuItem("menu/sort/descending", "Descending", .{ .icon = if (!t.ascending) .checkmark else null })) {
-        if (t.ascending) t.sortBy(t.sort_by, &self.mime, self.show_hidden);
-        self.menu = .none;
+    if (menus_mod.row(self, kit, "menu/sort/descending", "Descending", .{ .marked = !t.ascending })) {
+        self.sortOrder(false);
+        return close(self);
+    }
+    // Windows 11's Sort ends in Group by; Windows 10's ribbon has its own.
+    if (!self.ten()) {
+        menus_mod.separator(self, kit);
+        menus_mod.subRowMarked(self, kit, "menu/sort/group", "Group by", .apps_list, .group, false, false);
+    }
+}
+
+fn groupMenu(self: *Files, kit: *Kit) void {
+    if (closeOnPressOutside(self, kit, "menu/group", &.{ "cmd/sort", "ribbon/group", "context" })) return;
+    menus_mod.begin(self, kit, "menu/group", under(self, kit, "cmd/sort", "ribbon/group"));
+    defer menus_mod.end(kit);
+    const t = self.tab();
+    const items = [_]struct { by: ?Folder.Column, name: []const u8 }{
+        .{ .by = .name, .name = "Name" },
+        .{ .by = .modified, .name = "Date modified" },
+        .{ .by = .type, .name = "Type" },
+        .{ .by = .size, .name = "Size" },
+        .{ .by = null, .name = "(None)" },
+    };
+    for (items, 0..) |item, k| {
+        const on = if (item.by) |b| t.group_by == b else t.group_by == null;
+        if (k == items.len - 1) menus_mod.separator(self, kit);
+        if (menus_mod.row(self, kit, kit.print("menu/group/{d}", .{k}), item.name, .{ .marked = on })) {
+            self.groupBy(item.by);
+            return close(self);
+        }
     }
 }
 
 fn moreMenu(self: *Files, kit: *Kit) void {
-    closeOnPressOutside(self, kit, "menu/more", "cmd/more");
-    kit.menuBegin("menu/more", under("cmd/more"));
-    defer kit.menuEnd();
+    if (closeOnPressOutside(self, kit, "menu/more", &.{"cmd/more"})) return;
+    menus_mod.begin(self, kit, "menu/more", under(self, kit, "cmd/more", "cmd/more"));
+    defer menus_mod.end(kit);
     const t = self.tab();
-    if (kit.menuItem("menu/more/all", "Select all", .{ .icon = .checkmark, .shortcut = "Ctrl+A", .disabled = t.count() == 0 })) {
+    const in_folder = t.path() != null;
+    const pinned = if (t.path()) |p| self.places.isPinned(p) else false;
+    if (menus_mod.row(self, kit, "menu/more/pin", if (pinned) "Unpin from Quick access" else "Pin to Quick access", .{ .icon = .pin, .disabled = !in_folder })) {
+        close(self);
+        return actions.pinChosen(self);
+    }
+    menus_mod.separator(self, kit);
+    if (menus_mod.row(self, kit, "menu/more/all", "Select all", .{ .icon = .checkmark_circle, .shortcut = "Ctrl+A", .disabled = t.count() == 0 })) {
         t.selectAll();
-        self.menu = .none;
+        return close(self);
     }
-    if (kit.menuItem("menu/more/none", "Select none", .{ .icon = .dismiss, .disabled = t.selectedCount() == 0 })) {
+    if (menus_mod.row(self, kit, "menu/more/none", "Select none", .{ .icon = .dismiss, .disabled = t.selectedCount() == 0 })) {
         t.selectNone();
-        self.menu = .none;
+        return close(self);
     }
-    if (kit.menuItem("menu/more/invert", "Invert selection", .{ .icon = .arrow_sync, .disabled = t.count() == 0 })) {
+    if (menus_mod.row(self, kit, "menu/more/invert", "Invert selection", .{ .icon = .arrow_sync, .disabled = t.count() == 0 })) {
         t.invertSelection();
-        self.menu = .none;
+        return close(self);
+    }
+    menus_mod.separator(self, kit);
+    if (menus_mod.row(self, kit, "menu/more/properties", "Properties", .{ .icon = .info, .shortcut = "Alt+Enter", .disabled = !in_folder and t.selectedCount() == 0 })) {
+        close(self);
+        return self.openProperties();
+    }
+    if (menus_mod.row(self, kit, "menu/more/terminal", "Open in Terminal", .{ .icon = .window_console, .disabled = !in_folder })) {
+        close(self);
+        return actions.terminalHere(self);
+    }
+    menus_mod.separator(self, kit);
+    if (menus_mod.row(self, kit, "menu/more/window", "Open new window", .{ .icon = .window, .shortcut = "Ctrl+N" })) {
+        close(self);
+        return self.openNewWindow();
     }
 }
 
 fn newMenu(self: *Files, kit: *Kit) void {
-    closeOnPressOutside(self, kit, "menu/new", "cmd/new");
-    kit.menuBegin("menu/new", under("cmd/new"));
-    defer kit.menuEnd();
-    if (kit.menuItem("menu/new/folder", "Folder", .{ .icon = .folder, .shortcut = "Ctrl+Shift+N" })) actions.newFolder(self);
-    if (kit.menuItem("menu/new/text", "Text Document", .{ .icon = .document })) actions.newTextFile(self);
+    if (closeOnPressOutside(self, kit, "menu/new", &.{ "cmd/new", "ribbon/new-item", "context" })) return;
+    menus_mod.begin(self, kit, "menu/new", under(self, kit, "cmd/new", "ribbon/new-item"));
+    defer menus_mod.end(kit);
+    if (menus_mod.row(self, kit, "menu/new/folder", "Folder", .{ .themed = "folder", .shortcut = "Ctrl+Shift+N" })) {
+        close(self);
+        return actions.newFolder(self);
+    }
+    if (menus_mod.row(self, kit, "menu/new/shortcut", "Shortcut", .{ .icon = .arrow_reply, .disabled = !actions.canPaste(self) })) {
+        close(self);
+        return actions.pasteShortcut(self);
+    }
+    menus_mod.separator(self, kit);
+    if (menus_mod.row(self, kit, "menu/new/text", "Text Document", .{ .themed = "text-x-generic" })) {
+        close(self);
+        return actions.newTextFile(self);
+    }
+}
+
+/// Windows 10's Move to and Copy to: the person's folders, at once, as
+/// large as Windows shows them.
+fn placesMenu(self: *Files, kit: *Kit) void {
+    const moving = self.menu == .move_to;
+    const button = if (moving) "ribbon/move-to" else "ribbon/copy-to";
+    if (closeOnPressOutside(self, kit, "menu/places", &.{button})) return;
+    menus_mod.begin(self, kit, "menu/places", .{ .attach = .id, .to = button, .fractions = .{ .element_x = 0, .element_y = 0, .target_x = 0, .target_y = 1 }, .z_index = 50 });
+    defer menus_mod.end(kit);
+    for (self.places.user.items, 0..) |f, i| {
+        if (menus_mod.row(self, kit, kit.print("menu/places/{d}", .{i}), f.name, .{ .themed = @import("icons.zig").special(f.special) })) {
+            close(self);
+            var buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const to = std.fmt.bufPrint(&buffer, "{s}", .{f.path}) catch return;
+            return actions.sendTo(self, to, moving);
+        }
+    }
+    for (self.places.pinned.items, 0..) |f, i| {
+        if (menus_mod.row(self, kit, kit.print("menu/places/pin/{d}", .{i}), f.name, .{ .themed = "folder" })) {
+            close(self);
+            var buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const to = std.fmt.bufPrint(&buffer, "{s}", .{f.path}) catch return;
+            return actions.sendTo(self, to, moving);
+        }
+    }
+}
+
+/// Windows 10's recent locations: back and forward in one list.
+fn recentMenu(self: *Files, kit: *Kit) void {
+    if (closeOnPressOutside(self, kit, "menu/recent", &.{"nav/recent"})) return;
+    menus_mod.begin(self, kit, "menu/recent", .{ .attach = .id, .to = "nav/recent", .fractions = .{ .element_x = 0, .element_y = 0, .target_x = 0, .target_y = 1 }, .z_index = 50 });
+    defer menus_mod.end(kit);
+    const t = self.tab();
+    var buffer: [256]u8 = undefined;
+    // Forward ones above, the one here ticked, back ones below - newest
+    // nearest.
+    var steps: isize = @intCast(t.forward_stack.items.len);
+    for (t.forward_stack.items) |l| {
+        if (menus_mod.row(self, kit, kit.print("menu/recent/f{d}", .{steps}), self.locationName(l, &buffer), .{ .marked = false })) {
+            close(self);
+            for (0..@intCast(steps)) |_| t.goForward();
+            self.arrivedPublic();
+            return;
+        }
+        steps -= 1;
+    }
+    _ = menus_mod.row(self, kit, "menu/recent/here", self.locationName(t.location, &buffer), .{ .marked = true, .ticked = true, .strong = true });
+    var back: usize = 1;
+    var k = t.back_stack.items.len;
+    while (k > 0) : (back += 1) {
+        k -= 1;
+        if (menus_mod.row(self, kit, kit.print("menu/recent/b{d}", .{back}), self.locationName(t.back_stack.items[k], &buffer), .{ .marked = false })) {
+            close(self);
+            for (0..back) |_| t.goBack();
+            self.arrivedPublic();
+            return;
+        }
+    }
 }
