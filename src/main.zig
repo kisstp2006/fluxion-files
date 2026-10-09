@@ -46,6 +46,8 @@ test {
     _ = @import("Folder.zig");
     _ = @import("Places.zig");
     _ = @import("OpenWith.zig");
+    _ = @import("Ops.zig");
+    _ = @import("actions.zig");
     _ = @import("views.zig");
     _ = @import("ImageFile.zig");
     _ = @import("apps.zig");

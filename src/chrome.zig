@@ -15,6 +15,7 @@ const Files = @import("Files.zig");
 const Tab = @import("Tab.zig");
 const Folder = @import("Folder.zig");
 const Window = @import("Window.zig");
+const actions = @import("actions.zig");
 
 /// The title bar's height in Windows 11's look, the tabs at its foot.
 const title_h = 40;
@@ -337,12 +338,12 @@ pub fn commandBar(self: *Files, kit: *Kit) void {
     defer u.close();
     if (menuButton(kit, "cmd/new", .add, "New", in_folder)) self.menu = if (self.menu == .new) .none else .new;
     divider(kit);
-    _ = commandButton(kit, "cmd/cut", .cut, "Cut", chosen);
-    _ = commandButton(kit, "cmd/copy", .copy, "Copy", chosen);
-    _ = commandButton(kit, "cmd/paste", .clipboard_paste, "Paste", false);
-    _ = commandButton(kit, "cmd/rename", .rename, "Rename", t.selectedCount() == 1);
-    _ = commandButton(kit, "cmd/share", .share, "Share", chosen);
-    _ = commandButton(kit, "cmd/delete", .delete, "Delete", chosen);
+    if (commandButton(kit, "cmd/cut", .cut, "Cut (Ctrl+X)", chosen)) actions.copy(self, true);
+    if (commandButton(kit, "cmd/copy", .copy, "Copy (Ctrl+C)", chosen)) actions.copy(self, false);
+    if (commandButton(kit, "cmd/paste", .clipboard_paste, "Paste (Ctrl+V)", actions.canPaste(self))) actions.paste(self);
+    if (commandButton(kit, "cmd/rename", .rename, "Rename (F2)", t.selectedCount() == 1)) if (t.current()) |i| self.startRename(i);
+    _ = commandButton(kit, "cmd/share", .share, "Share", false);
+    if (commandButton(kit, "cmd/delete", .delete, "Delete (Del)", chosen)) actions.delete(self, false);
     divider(kit);
     if (menuButton(kit, "cmd/sort", .arrow_sort, "Sort", in_folder)) self.menu = if (self.menu == .sort) .none else .sort;
     if (menuButton(kit, "cmd/view", .grid, "View", true)) self.menu = if (self.menu == .view) .none else .view;
@@ -446,19 +447,25 @@ pub fn ribbon(self: *Files, kit: *Kit) void {
         ribbonGroupBegin(kit, "Clipboard");
         defer ribbonGroupEnd(kit, "Clipboard");
         _ = ribbonLarge(kit, "ribbon/pin", .pin, "Pin to Quick\naccess", false);
-        _ = ribbonLarge(kit, "ribbon/copy", .copy, "Copy", chosen);
-        _ = ribbonLarge(kit, "ribbon/paste", .clipboard_paste, "Paste", false);
+        if (ribbonLarge(kit, "ribbon/copy", .copy, "Copy", chosen)) actions.copy(self, false);
+        if (ribbonLarge(kit, "ribbon/paste", .clipboard_paste, "Paste", actions.canPaste(self))) actions.paste(self);
+        {
+            u.open(.{ .direction = .top_to_bottom, .gap = 2, .padding = .xy(2, 2) });
+            defer u.close();
+            if (ribbonSmall(kit, "ribbon/cut", .cut, "Cut", chosen)) actions.copy(self, true);
+            if (ribbonSmall(kit, "ribbon/copy-path", .clipboard_paste, "Copy path", true)) actions.copyAsPath(self);
+        }
     }
     {
         ribbonGroupBegin(kit, "Organise");
         defer ribbonGroupEnd(kit, "Organise");
-        _ = ribbonLarge(kit, "ribbon/delete", .delete, "Delete", chosen);
-        _ = ribbonLarge(kit, "ribbon/rename", .rename, "Rename", t.selectedCount() == 1);
+        if (ribbonLarge(kit, "ribbon/delete", .delete, "Delete", chosen)) actions.delete(self, false);
+        if (ribbonLarge(kit, "ribbon/rename", .rename, "Rename", t.selectedCount() == 1)) if (t.current()) |i| self.startRename(i);
     }
     {
         ribbonGroupBegin(kit, "New");
         defer ribbonGroupEnd(kit, "New");
-        _ = ribbonLarge(kit, "ribbon/new-folder", .folder, "New\nfolder", t.path() != null);
+        if (ribbonLarge(kit, "ribbon/new-folder", .folder, "New\nfolder", t.path() != null)) actions.newFolder(self);
     }
     {
         ribbonGroupBegin(kit, "Open");
@@ -725,6 +732,6 @@ fn newMenu(self: *Files, kit: *Kit) void {
     closeOnPressOutside(self, kit, "menu/new", "cmd/new");
     kit.menuBegin("menu/new", under("cmd/new"));
     defer kit.menuEnd();
-    _ = kit.menuItem("menu/new/folder", "Folder", .{ .icon = .folder, .shortcut = "Ctrl+Shift+N" });
-    _ = kit.menuItem("menu/new/text", "Text Document", .{ .icon = .document });
+    if (kit.menuItem("menu/new/folder", "Folder", .{ .icon = .folder, .shortcut = "Ctrl+Shift+N" })) actions.newFolder(self);
+    if (kit.menuItem("menu/new/text", "Text Document", .{ .icon = .document })) actions.newTextFile(self);
 }

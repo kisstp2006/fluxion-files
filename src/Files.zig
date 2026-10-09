@@ -37,6 +37,8 @@ const apps_mod = @import("apps.zig");
 const chrome = @import("chrome.zig");
 const nav = @import("nav.zig");
 const views = @import("views.zig");
+const actions = @import("actions.zig");
+const menus = @import("menus.zig");
 
 const Files = @This();
 
@@ -72,6 +74,30 @@ maximize_rest_ms: i64 = 0,
 layouts_shown: bool = false,
 /// A menu open: View, Sort, New, "···".
 menu: Menu = .none,
+/// What was copied or cut, by full path, to be pasted.
+clipboard: std.ArrayList([]u8) = .empty,
+clipboard_cut: bool = false,
+/// The item whose name is being typed anew, and how many drawings the
+/// field has been there.
+renaming: ?usize = null,
+rename_draws: u8 = 0,
+/// A question asked over the window.
+confirm: ?Confirm = null,
+/// What went wrong last, said at the top of the folder until closed.
+notice_buffer: [256]u8 = undefined,
+notice_len: usize = 0,
+/// A right click, where it was - the menu for what it was on, or for the
+/// folder - and whether the full ("Show more options") menu is asked for.
+context_at: ?[2]f32 = null,
+context_open: ?[2]f32 = null,
+context_on_item: bool = false,
+context_more: bool = false,
+/// A middle click, to be answered by what it was on.
+middle_click: bool = false,
+/// The folder in front watched for changes, and when to read it again.
+watch_fd: ?std.c.fd_t = null,
+watch_wd: i32 = -1,
+refresh_due_ms: i64 = 0,
 /// Items on a row of the view drawn last: what Up and Down move by.
 grid_columns: usize = 1,
 /// The place chosen on Home or This PC, by its element's id.
@@ -80,6 +106,7 @@ page_chosen_buffer: [64]u8 = undefined,
 page_chosen_len: usize = 0,
 
 pub const Menu = enum { none, view, sort, more, new };
+pub const Confirm = enum { delete_permanently };
 
 pub fn init(self: *Files, gpa: std.mem.Allocator, io: std.Io, start: ?[]const u8) !void {
     const look = Look.load(io);
@@ -105,6 +132,11 @@ pub fn init(self: *Files, gpa: std.mem.Allocator, io: std.Io, start: ?[]const u8
         self.retheme_timer = @intCast(timer);
         self.window.addWatch(.{ .fd = @intCast(timer), .context = self, .ready = rethemeRang });
     }
+    const watch = std.os.linux.inotify_init1(std.os.linux.IN.NONBLOCK | std.os.linux.IN.CLOEXEC);
+    if (std.os.linux.errno(watch) == .SUCCESS) {
+        self.watch_fd = @intCast(watch);
+        self.window.addWatch(.{ .fd = @intCast(watch), .context = self, .ready = folderChanged });
+    }
     const first: Tab.Location = if (start) |p| .{ .folder = p } else .home;
     self.newTab(first);
 }
@@ -116,6 +148,9 @@ pub fn deinit(self: *Files) void {
     }
     self.tabs.deinit(self.gpa);
     if (self.apps) |*a| a.deinit();
+    for (self.clipboard.items) |p| self.gpa.free(p);
+    self.clipboard.deinit(self.gpa);
+    if (self.watch_fd) |fd| _ = std.c.close(fd);
     if (self.look_watch) |fd| _ = std.c.close(fd);
     if (self.retheme_timer) |fd| _ = std.c.close(fd);
     self.open_with.deinit();
@@ -207,13 +242,70 @@ pub fn refresh(self: *Files) void {
     self.window.redraw();
 }
 
+/// Every tab showing a folder read again: something was done to files.
+pub fn refreshAll(self: *Files) void {
+    for (self.tabs.items) |t| if (t.path() != null) t.read(self.io, &self.mime, self.show_hidden);
+    self.window.redraw();
+}
+
+/// Say what went wrong, at the top of the folder.
+pub fn notify(self: *Files, what: []const u8, err: anyerror) void {
+    log.warn("{s}: {t}", .{ what, err });
+    const text = std.fmt.bufPrint(&self.notice_buffer, "{s} ({t}).", .{ what, err }) catch what;
+    self.notice_len = text.len;
+    self.window.redraw();
+}
+
+pub fn notice(self: *const Files) ?[]const u8 {
+    return if (self.notice_len > 0) self.notice_buffer[0..self.notice_len] else null;
+}
+
+/// Type a new name for item `i`, in its place.
+pub fn startRename(self: *Files, i: usize) void {
+    const t = self.tab();
+    if (t.path() == null or i >= t.count()) return;
+    self.renaming = i;
+    self.rename_draws = 0;
+    t.focus = i;
+    t.reveal = true;
+    self.window.redraw();
+}
+
+/// The folder in front changed on disk: read again a moment later, once a
+/// burst of changes has settled.
+fn folderChanged(context: *anyopaque) void {
+    const self: *Files = @ptrCast(@alignCast(context));
+    var buffer: [4096]u8 align(@alignOf(std.os.linux.inotify_event)) = undefined;
+    while (std.c.read(self.watch_fd.?, &buffer, buffer.len) > 0) {}
+    if (self.refresh_due_ms == 0) self.refresh_due_ms = Window.nowMs() + 150;
+    self.window.wakeAt(self.refresh_due_ms);
+}
+
+/// Watch the folder in front - and only it.
+fn watchFolder(self: *Files) void {
+    const fd = self.watch_fd orelse return;
+    if (self.watch_wd >= 0) _ = std.os.linux.inotify_rm_watch(fd, self.watch_wd);
+    self.watch_wd = -1;
+    const path = self.tab().path() orelse return;
+    var z: [std.fs.max_path_bytes + 1]u8 = undefined;
+    if (path.len >= z.len) return;
+    @memcpy(z[0..path.len], path);
+    z[path.len] = 0;
+    const L = std.os.linux.IN;
+    const wd = std.os.linux.inotify_add_watch(fd, @ptrCast(&z), L.CREATE | L.DELETE | L.MOVED_FROM | L.MOVED_TO | L.CLOSE_WRITE | L.ATTRIB);
+    if (std.os.linux.errno(wd) == .SUCCESS) self.watch_wd = @intCast(wd);
+}
+
 /// Arrived somewhere: the folder read, the title and the scroll set.
 fn arrived(self: *Files) void {
     const t = self.tab();
     self.editing_address = false;
     self.menu = .none;
     self.page_chosen = null;
+    self.renaming = null;
+    self.notice_len = 0;
     if (t.path() != null and t.folder == null) t.read(self.io, &self.mime, self.show_hidden);
+    self.watchFolder();
     self.window.layout.scrollTo("view/scroll", 0, 0);
     var buffer: [256]u8 = undefined;
     self.window.setTitle(self.titleOf(t, &buffer));
@@ -334,6 +426,11 @@ fn draw(context: *anyopaque, window: *Window, kit: *Kit) void {
     const self: *Files = @ptrCast(@alignCast(context));
     const u = kit.ui;
     const p = &kit.theme.palette;
+    // Changed on disk a moment ago: read again.
+    if (self.refresh_due_ms != 0 and Window.nowMs() >= self.refresh_due_ms) {
+        self.refresh_due_ms = 0;
+        if (self.renaming == null) self.tab().read(self.io, &self.mime, self.show_hidden);
+    }
     // Over Mica, the window's base is the glass; without it, solid.
     u.open(.{
         .id = "files",
@@ -361,6 +458,11 @@ fn draw(context: *anyopaque, window: *Window, kit: *Kit) void {
     }
     chrome.statusBar(self, kit);
     chrome.menus(self, kit);
+    menus.context(self, kit);
+    menus.confirmDialog(self, kit);
+    // A right or middle click on nothing that took it.
+    self.context_at = null;
+    self.middle_click = false;
 }
 
 // -------------------------------------------------------------------------
@@ -396,6 +498,28 @@ fn key(context: *anyopaque, window: *Window, sym: xkb.Keysym) bool {
             else => return false,
         }
     }
+    if (self.renaming != null and u.isFocused("rename/field")) {
+        switch (code) {
+            K.Escape => {
+                self.renaming = null;
+                u.clearFocus();
+                return true;
+            },
+            K.Return, K.KP_Enter => {
+                actions.commitRename(self);
+                return true;
+            },
+            else => return false,
+        }
+    }
+    if (self.confirm != null) {
+        switch (code) {
+            K.Escape, K.n, K.N => self.confirm = null,
+            K.Return, K.KP_Enter, K.y, K.Y => menus.confirmed(self),
+            else => {},
+        }
+        return true;
+    }
     if (u.isFocused("search/field")) {
         if (code == K.Escape) {
             u.setTextValue("search/field", "");
@@ -406,6 +530,10 @@ fn key(context: *anyopaque, window: *Window, sym: xkb.Keysym) bool {
     }
     if (self.menu != .none and code == K.Escape) {
         self.menu = .none;
+        return true;
+    }
+    if (self.context_open != null and code == K.Escape) {
+        self.context_open = null;
         return true;
     }
 
@@ -428,6 +556,14 @@ fn key(context: *anyopaque, window: *Window, sym: xkb.Keysym) bool {
         // Ctrl+Shift+1…8: the views, Extra large icons to Content.
         if (code >= K.@"1" and code <= K.@"8") {
             self.setView(@enumFromInt(code - K.@"1"));
+            return true;
+        }
+        if (code == K.N or code == K.n) {
+            actions.newFolder(self);
+            return true;
+        }
+        if (code == K.C or code == K.c) {
+            actions.copyAsPath(self);
             return true;
         }
         // Shift with the digits types !"§$…: the keys by where they are.
@@ -465,6 +601,22 @@ fn key(context: *anyopaque, window: *Window, sym: xkb.Keysym) bool {
             t.selectAll();
             return true;
         },
+        K.c, K.C, K.Insert => {
+            actions.copy(self, false);
+            return true;
+        },
+        K.x, K.X => {
+            actions.copy(self, true);
+            return true;
+        },
+        K.v, K.V => {
+            actions.paste(self);
+            return true;
+        },
+        K.d, K.D => {
+            actions.delete(self, false);
+            return true;
+        },
         K.r, K.R => {
             self.refresh();
             return true;
@@ -480,6 +632,8 @@ fn key(context: *anyopaque, window: *Window, sym: xkb.Keysym) bool {
     };
     switch (code) {
         K.F4 => self.editAddress(),
+        K.F2 => if (t.current()) |i| self.startRename(i),
+        K.Delete => actions.delete(self, shift),
         K.F5 => self.refresh(),
         K.F3 => u.setFocus("search/field"),
         K.BackSpace => self.goBack(),
@@ -535,10 +689,15 @@ pub fn setView(self: *Files, view: Tab.View) void {
 
 fn pointerButton(context: *anyopaque, window: *Window, code: u32) bool {
     const self: *Files = @ptrCast(@alignCast(context));
-    _ = window;
     switch (code) {
         Window.button_back => self.goBack(),
         Window.button_forward => self.goForward(),
+        // Answered in the next drawing, by what it was on.
+        Window.button_right => {
+            self.context_at = window.pointer_at;
+            self.context_more = window.modifierHeld("Shift");
+        },
+        Window.button_middle => self.middle_click = true,
         else => return false,
     }
     return true;

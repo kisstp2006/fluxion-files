@@ -23,6 +23,8 @@ const Window = @import("Window.zig");
 const chrome = @import("chrome.zig");
 const nav = @import("nav.zig");
 const icons = @import("icons.zig");
+const menus = @import("menus.zig");
+const actions = @import("actions.zig");
 
 const scroll_id = "view/scroll";
 
@@ -77,6 +79,51 @@ fn shownName(self: *Files, e: *const Folder.Entry) []const u8 {
     return if (dot == 0) e.name else e.name[0..dot];
 }
 
+/// A right click on item `i`: chosen, if it was not, and its menu; a
+/// middle click on a folder: it in a new tab.
+fn requests(self: *Files, u: *ui.Ui, id: []const u8, i: usize) void {
+    const t = self.tab();
+    if (self.context_at) |at| if (u.isPointerOver(id)) {
+        if (!t.selected.items[i]) t.click(i, false, false);
+        menus.openAt(self, at, true);
+        self.context_at = null;
+    };
+    if (self.middle_click and u.isPointerOver(id)) {
+        self.middle_click = false;
+        if (t.entry(i).isFolder()) self.open(i, true);
+    }
+}
+
+/// An item's name - or, being renamed, the field its new name is typed in,
+/// the name in it with all but its extension chosen, as Windows has it.
+fn nameOrField(self: *Files, kit: *Kit, i: usize, e: *const Folder.Entry, style: ui.TextStyle) void {
+    const u = kit.ui;
+    if (self.renaming != i) {
+        u.text(shownName(self, e), style);
+        return;
+    }
+    kit.textField("rename/field", .{ .width = .grow });
+    switch (self.rename_draws) {
+        0 => u.setFocus("rename/field"),
+        1 => {
+            u.setTextValue("rename/field", e.name);
+            _ = u.textAction(.moveTo(.start, false));
+            const dot = if (e.isFolder()) e.name.len else std.mem.lastIndexOfScalar(u8, e.name, '.') orelse e.name.len;
+            const stem = if (dot == 0) e.name.len else dot;
+            const chars = std.unicode.utf8CountCodepoints(e.name[0..stem]) catch stem;
+            for (0..chars) |_| _ = u.textAction(.moveTo(.right, true));
+        },
+        else => {},
+    }
+    if (self.rename_draws < 3) {
+        self.rename_draws += 1;
+        self.window.redraw();
+    } else if (!u.isFocused("rename/field")) {
+        // Clicked away: the name typed is given, as Windows gives it.
+        actions.commitRename(self);
+    }
+}
+
 /// A click, a Ctrl or Shift click, a double click, on item `i`.
 fn pressed(self: *Files, i: usize) void {
     const t = self.tab();
@@ -98,7 +145,14 @@ fn folderView(self: *Files, kit: *Kit) void {
     const u = kit.ui;
     const p = &kit.theme.palette;
     const t = self.tab();
+    noticeBar(self, kit);
     if (t.view == .details) detailsHeader(self, kit);
+    defer if (self.context_at) |at| if (u.isPointerOver(scroll_id)) {
+        // On nothing: the folder's own menu, and nothing chosen.
+        t.selectNone();
+        menus.openAt(self, at, false);
+        self.context_at = null;
+    };
     u.open(.{
         .id = scroll_id,
         .width = .grow,
@@ -248,6 +302,7 @@ fn detailsRow(self: *Files, kit: *Kit, i: usize, row_h: f32) void {
     });
     defer u.close();
     if (u.justPressed()) pressed(self, i);
+    requests(self, u, id, i);
     const faded = e.hidden;
     const ink = if (faded) p.text_secondary else p.text_primary;
     {
@@ -258,7 +313,7 @@ fn detailsRow(self: *Files, kit: *Kit, i: usize, row_h: f32) void {
         u.close();
         var style = kit.style(.body, ink);
         style.wrap = .none;
-        u.text(shownName(self, e), style);
+        nameOrField(self, kit, i, e, style);
     }
     var secondary = kit.style(.body, p.text_secondary);
     secondary.wrap = .none;
@@ -365,13 +420,14 @@ fn contentRow(self: *Files, kit: *Kit, i: usize, row_h: f32) void {
     });
     defer u.close();
     if (u.justPressed()) pressed(self, i);
+    requests(self, u, id, i);
     icons.forEntry(self, kit, t.path().?, e, 32);
     {
         u.open(.{ .width = .grow, .direction = .top_to_bottom, .gap = 2, .clip = .both });
         defer u.close();
         var style = kit.style(.body, p.text_primary);
         style.wrap = .none;
-        u.text(shownName(self, e), style);
+        nameOrField(self, kit, i, e, style);
         var type_buffer: [64]u8 = undefined;
         var small = kit.style(.caption, p.text_secondary);
         small.wrap = .none;
@@ -439,6 +495,7 @@ fn iconCell(self: *Files, kit: *Kit, i: usize, cell: [2]f32, icon: u16) void {
     });
     defer u.close();
     if (u.justPressed()) pressed(self, i);
+    requests(self, u, id, i);
     u.open(.{ .width = .grow, .height = .fixed(@floatFromInt(icon)), .align_x = .center, .align_y = .bottom });
     icons.forEntry(self, kit, t.path().?, e, icon);
     u.close();
@@ -446,7 +503,7 @@ fn iconCell(self: *Files, kit: *Kit, i: usize, cell: [2]f32, icon: u16) void {
     style.alignment = .center;
     style.wrap = .words;
     u.open(.{ .width = .grow, .height = .grow, .clip = .both, .align_x = .center });
-    u.text(shownName(self, e), style);
+    nameOrField(self, kit, i, e, style);
     u.close();
 }
 
@@ -471,10 +528,11 @@ fn smallCell(self: *Files, kit: *Kit, i: usize, cell: [2]f32) void {
     });
     defer u.close();
     if (u.justPressed()) pressed(self, i);
+    requests(self, u, id, i);
     icons.forEntry(self, kit, t.path().?, e, 16);
     var style = kit.style(.body, p.text_primary);
     style.wrap = .none;
-    u.text(shownName(self, e), style);
+    nameOrField(self, kit, i, e, style);
 }
 
 fn tileCell(self: *Files, kit: *Kit, i: usize, cell: [2]f32) void {
@@ -498,12 +556,13 @@ fn tileCell(self: *Files, kit: *Kit, i: usize, cell: [2]f32) void {
     });
     defer u.close();
     if (u.justPressed()) pressed(self, i);
+    requests(self, u, id, i);
     icons.forEntry(self, kit, t.path().?, e, 48);
     u.open(.{ .width = .grow, .direction = .top_to_bottom, .gap = 1, .clip = .both });
     defer u.close();
     var style = kit.style(.body, p.text_primary);
     style.wrap = .none;
-    u.text(shownName(self, e), style);
+    nameOrField(self, kit, i, e, style);
     var small = kit.style(.caption, p.text_secondary);
     small.wrap = .none;
     var type_buffer: [64]u8 = undefined;
@@ -512,6 +571,30 @@ fn tileCell(self: *Files, kit: *Kit, i: usize, cell: [2]f32) void {
         var size_buffer: [32]u8 = undefined;
         u.text(kit.print("{s}", .{Folder.sizeText(e.size, &size_buffer)}), small);
     }
+}
+
+/// What went wrong last, across the top of the folder, until closed.
+fn noticeBar(self: *Files, kit: *Kit) void {
+    const text = self.notice() orelse return;
+    const u = kit.ui;
+    const p = &kit.theme.palette;
+    u.open(.{
+        .id = "notice",
+        .width = .grow,
+        .padding = .xy(12, 8),
+        .gap = 10,
+        .align_y = .center,
+        .background_color = p.critical_background,
+        .border = .{ .color = p.divider, .width = .{ .bottom = 1 } },
+    });
+    defer u.close();
+    kit.icon(.error_circle, 16, p.critical, .filled);
+    u.open(.{ .width = .grow });
+    var style = kit.style(.body, p.text_primary);
+    style.wrap = .words;
+    u.text(text, style);
+    u.close();
+    if (kit.button("notice/close", "", .{ .kind = .subtle, .icon = .dismiss })) self.notice_len = 0;
 }
 
 // -------------------------------------------------------------------------

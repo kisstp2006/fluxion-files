@@ -61,6 +61,9 @@ pub const Content = struct {
     close: ?*const fn (context: *anyopaque, window: *Window) void = null,
 };
 
+/// A kind of data offered on the clipboard, and the bytes of it.
+pub const Offered = struct { mime: [:0]const u8, data: []u8 };
+
 /// The pointer's buttons, as evdev numbers them.
 pub const button_right = 0x111;
 pub const button_middle = 0x112;
@@ -96,6 +99,11 @@ acrylic: bool = false,
 glass_strip: u32 = 0,
 pointer: ?*wl.Pointer = null,
 keyboard: ?*wl.Keyboard = null,
+/// The clipboard: what this window offers on it, while it is its.
+data_manager: ?*wl.DataDeviceManager = null,
+data_device: ?*wl.DataDevice = null,
+selection_source: ?*wl.DataSource = null,
+selection: std.ArrayList(Offered) = .empty,
 
 surface: *wl.Surface = undefined,
 xdg_surface: *xdg.Surface = undefined,
@@ -276,6 +284,9 @@ pub fn clickCount(self: *const Window) u8 {
 pub fn deinit(self: *Window) void {
     if (self.frame_callback) |c| c.destroy();
     for (self.buffers) |maybe| if (maybe) |b| b.destroy(self.gpa);
+    self.dropSelection();
+    self.selection.deinit(self.gpa);
+    if (self.data_device) |d| d.release();
     if (self.decoration) |d| d.destroy();
     if (self.frame) |f| f.destroy();
     if (self.frames) |m| m.destroy();
@@ -354,6 +365,71 @@ pub fn addWatch(self: *Window, watch: Watch) void {
     self.watch_count += 1;
 }
 
+fn ensureDataDevice(self: *Window) void {
+    if (self.data_device != null) return;
+    const manager = self.data_manager orelse return;
+    const seat = self.seat orelse return;
+    self.data_device = manager.getDataDevice(seat) catch null;
+}
+
+/// Put `offers` on the clipboard - each kind with its bytes - as this
+/// window's, until something else takes it.
+pub fn setSelection(self: *Window, offers: []const struct { mime: [:0]const u8, data: []const u8 }) void {
+    const manager = self.data_manager orelse return;
+    const device = self.data_device orelse return;
+    self.dropSelection();
+    const source = manager.createDataSource() catch return;
+    for (offers) |o| {
+        const copy = self.gpa.dupe(u8, o.data) catch continue;
+        self.selection.append(self.gpa, .{ .mime = o.mime, .data = copy }) catch {
+            self.gpa.free(copy);
+            continue;
+        };
+        source.offer(o.mime);
+    }
+    source.setListener(*Window, dataSourceListener, self);
+    device.setSelection(source, self.last_serial);
+    self.selection_source = source;
+}
+
+/// Text on the clipboard: Copy as path.
+pub fn copyText(self: *Window, text: []const u8) void {
+    self.setSelection(&.{
+        .{ .mime = "text/plain;charset=utf-8", .data = text },
+        .{ .mime = "UTF8_STRING", .data = text },
+        .{ .mime = "text/plain", .data = text },
+    });
+}
+
+fn dropSelection(self: *Window) void {
+    if (self.selection_source) |source| source.destroy();
+    self.selection_source = null;
+    for (self.selection.items) |o| self.gpa.free(o.data);
+    self.selection.clearRetainingCapacity();
+}
+
+fn dataSourceListener(source: *wl.DataSource, event: wl.DataSource.Event, self: *Window) void {
+    switch (event) {
+        .send => |send| {
+            defer _ = std.c.close(send.fd);
+            const wanted = std.mem.span(send.mime_type);
+            for (self.selection.items) |o| {
+                if (!std.mem.eql(u8, o.mime, wanted)) continue;
+                var written: usize = 0;
+                while (written < o.data.len) {
+                    const n = std.c.write(send.fd, o.data[written..].ptr, o.data.len - written);
+                    if (n <= 0) break;
+                    written += @intCast(n);
+                }
+                return;
+            }
+        },
+        // Something else is on the clipboard now.
+        .cancelled => if (self.selection_source == source) self.dropSelection() else source.destroy(),
+        else => {},
+    }
+}
+
 /// Run until the window is closed.
 pub fn run(self: *Window) !void {
     while (self.running) {
@@ -423,6 +499,9 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Win
                 self.decorations = registry.bind(global.name, zxdg.DecorationManagerV1, 1) catch return;
             } else if (std.mem.eql(u8, name, std.mem.span(wp.FractionalScaleManagerV1.interface.name))) {
                 self.fractional_manager = registry.bind(global.name, wp.FractionalScaleManagerV1, 1) catch return;
+            } else if (std.mem.eql(u8, name, std.mem.span(wl.DataDeviceManager.interface.name))) {
+                self.data_manager = registry.bind(global.name, wl.DataDeviceManager, 3) catch return;
+                self.ensureDataDevice();
             } else if (std.mem.eql(u8, name, std.mem.span(fluxion.WindowManagerV1.interface.name))) {
                 self.frames = registry.bind(global.name, fluxion.WindowManagerV1, 1) catch return;
             } else if (std.mem.eql(u8, name, std.mem.span(ext.BackgroundEffectManagerV1.interface.name))) {
@@ -433,6 +512,7 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Win
                 if (self.seat != null) return;
                 self.seat = registry.bind(global.name, wl.Seat, 7) catch return;
                 self.seat.?.setListener(*Window, seatListener, self);
+                self.ensureDataDevice();
             }
         },
         .global_remove => {},
@@ -756,6 +836,7 @@ fn keyboardListener(_: *wl.Keyboard, event: wl.Keyboard.Event, self: *Window) vo
             if (self.xkb_state) |state| _ = state.updateMask(m.mods_depressed, m.mods_latched, m.mods_locked, 0, 0, m.group);
         },
         .key => |key| {
+            self.last_serial = key.serial;
             const code = key.key + 8;
             if (key.state != .pressed) {
                 if (self.repeat_key == code) self.repeat_key = null;
