@@ -1,0 +1,35 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
+.{
+    .name = .fluxion_files,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0xf99ce66367773ddb,
+    .dependencies = .{
+        // The look: theme, widgets, fonts, icons - and through it Fluxion UI
+        // and its CPU renderer. Local while they are written side by side.
+        .fluxion_widgets = .{ .path = "../../fluxion/fluxion-widgets" },
+        // Pictures: the icons, and the thumbnails Files makes itself.
+        .fluxion_image = .{ .path = "../../fluxion/fluxion-image" },
+        // The message bus: the drives (UDisks2), the session's file manager
+        // service, the portal backend.
+        .fluxion_dbus = .{ .path = "../../fluxion/fluxion-dbus" },
+        .wayland = .{
+            .url = "https://codeberg.org/ifreund/zig-wayland/archive/v0.6.0.tar.gz",
+            .hash = "wayland-0.6.0-lQa1kqz8AQADQmdNJsNhLoNHcnEGEUjrOaPV-dtEnEmX",
+        },
+        .xkbcommon = .{
+            .url = "https://codeberg.org/ifreund/zig-xkbcommon/archive/v0.3.0.tar.gz",
+            .hash = "xkbcommon-0.3.0-VDqIe3K9AQB2fG5ZeRcMC9i7kfrp5m2rWgLrmdNn9azr",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "data",
+        "protocol",
+        "README.md",
+        "LICENSE",
+    },
+}

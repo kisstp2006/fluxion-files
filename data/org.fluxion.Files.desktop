@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Files
+Name[hu]=Fájlok
+Comment=Your folders and files, the drives and the Recycle Bin
+Comment[hu]=A mappáid és fájljaid, a meghajtók és a Lomtár
+Icon=system-file-manager
+Exec=fluxion-files %U
+Categories=System;FileTools;FileManager;Utility;Core;
+Keywords=files;folders;file manager;explorer;fájlok;mappák;fájlkezelő;
+MimeType=inode/directory;
+StartupWMClass=org.fluxion.Files
+OnlyShowIn=Fluxion;

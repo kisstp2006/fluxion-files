@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="fluxion_window_v1">
+  <copyright>
+    SPDX-License-Identifier: BSD-2-Clause
+
+    Copyright (c) 2026 TIGames &lt;kisstp2006@gmail.com&gt;
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are
+    met:
+
+    1. Redistributions of source code must retain the above copyright
+       notice, this list of conditions and the following disclaimer.
+    2. Redistributions in binary form must reproduce the above copyright
+       notice, this list of conditions and the following disclaimer in the
+       documentation and/or other materials provided with the distribution.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+    "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+    LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+    PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+    HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+    SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED
+    TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+    PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+    LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+    NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+    SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+  </copyright>
+
+  <description summary="apps that draw their own title bar, framed by the compositor">
+    An app that draws its own title bar - Files, its tabs in it - but not
+    the rest of a window's frame asks here for what the compositor gives
+    the title bars it draws itself: the outline, the shadow and the rounded
+    corners round the window, and the layout picker under the maximise
+    button the pointer rests on.
+
+    Any client may bind it. It changes nothing about how the window is
+    moved, resized or maximised: that is xdg_toplevel's, as for any window
+    that draws its own title bar.
+  </description>
+
+  <interface name="fluxion_window_manager_v1" version="1">
+    <request name="destroy" type="destructor"/>
+
+    <request name="get_window">
+      <description summary="frame this toplevel">
+        From now on the toplevel is framed by the compositor as if its title
+        bar were the compositor's: its corners rounded where the look has
+        them, a shadow and an outline round it. It should have asked for
+        client-side decorations, and draw nothing outside its geometry.
+      </description>
+      <arg name="id" type="new_id" interface="fluxion_window_v1"/>
+      <arg name="toplevel" type="object" interface="xdg_toplevel"/>
+    </request>
+  </interface>
+
+  <interface name="fluxion_window_v1" version="1">
+    <request name="destroy" type="destructor">
+      <description summary="frame it no more"/>
+    </request>
+
+    <request name="show_layouts">
+      <description summary="the pointer rests on the maximise button">
+        Show the layout picker under the maximise button, whose box is given
+        in the surface's coordinates. It goes as it would from the
+        compositor's own button: when the pointer has left both. Nothing
+        happens where the look has no layout picker, or for a window that
+        cannot be resized.
+      </description>
+      <arg name="x" type="int"/>
+      <arg name="y" type="int"/>
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+    </request>
+  </interface>
+</protocol>
