@@ -24,6 +24,7 @@ const Tab = @import("Tab.zig");
 const Folder = @import("Folder.zig");
 const chrome = @import("chrome.zig");
 const icons = @import("icons.zig");
+const drag = @import("drag.zig");
 
 /// A folder opened in the tree, and the folders in it, read when it was.
 pub const Opened = struct {
@@ -175,6 +176,7 @@ fn pinnedFolders(self: *Files, kit: *Kit, going: *Going, depth: u8, chevrons: bo
     for (self.places.user.items, 0..) |f, i| folderRow(self, kit, going, kit.print("nav/user/{d}", .{i}), depth, f.path, f.name, icons.special(f.special), true, chevrons);
     for (self.places.pinned.items, 0..) |f, i| folderRow(self, kit, going, kit.print("nav/pin/{d}", .{i}), depth, f.path, f.name, "folder", true, chevrons);
     if (row(self, kit, "nav/trash", depth, .{ .themed = "user-trash" }, "Recycle Bin", here == .trash, null, false) == .go) going.to = .trash;
+    drag.answerTrash(self, kit.ui, "nav/trash");
 }
 
 fn drives(self: *Files, kit: *Kit, going: *Going, chevrons: bool) void {
@@ -193,7 +195,9 @@ fn folderRow(self: *Files, kit: *Kit, going: *Going, id: []const u8, depth: u8, 
     var id_buffer: [128]u8 = undefined;
     const own_id = std.fmt.bufPrint(&id_buffer, "{s}", .{id}) catch id;
     const lit = isLit(self, going, own_id, path);
-    switch (row(self, kit, own_id, depth, .{ .themed = icon }, name, lit, if (chevrons) opened != null else null, pinned)) {
+    const clicked = row(self, kit, own_id, depth, .{ .themed = icon }, name, lit, if (chevrons) opened != null else null, pinned);
+    drag.answerFolder(self, kit.ui, own_id, path);
+    switch (clicked) {
         .go => {
             going.folder(path);
             choose(self, own_id, path);

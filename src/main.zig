@@ -54,4 +54,6 @@ test {
     _ = @import("Search.zig");
     _ = @import("Thumbs.zig");
     _ = @import("Tab.zig");
+    _ = @import("Dnd.zig");
+    _ = @import("drag.zig");
 }

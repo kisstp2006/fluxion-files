@@ -224,7 +224,7 @@ fn mountTop(path: []const u8, buffer: []u8) ?[]const u8 {
     return std.fmt.bufPrint(buffer, "{s}", .{top}) catch null;
 }
 
-fn deviceOf(path: []const u8) ?u64 {
+pub fn deviceOf(path: []const u8) ?u64 {
     var z: [std.fs.max_path_bytes + 1]u8 = undefined;
     if (path.len >= z.len) return null;
     @memcpy(z[0..path.len], path);
@@ -455,7 +455,7 @@ pub fn moveInto(io: std.Io, source: []const u8, dest_dir: []const u8, buffer: []
 }
 
 /// Whether `path` is `folder` or inside it.
-fn isInside(path: []const u8, folder: []const u8) bool {
+pub fn isInside(path: []const u8, folder: []const u8) bool {
     if (!std.mem.startsWith(u8, path, folder)) return false;
     return path.len == folder.len or path[folder.len] == '/';
 }

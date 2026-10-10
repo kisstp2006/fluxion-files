@@ -45,6 +45,7 @@ const panes = @import("panes.zig");
 const property_sheet = @import("properties.zig");
 const Search = @import("Search.zig");
 const Thumbs = @import("Thumbs.zig");
+const drag = @import("drag.zig");
 
 const Files = @This();
 
@@ -153,6 +154,13 @@ search_wake: [2]std.c.fd_t = .{ -1, -1 },
 band_from: ?[2]f32 = null,
 /// What was chosen as the band began: what it adds to, with Ctrl.
 band_base: std.ArrayList(bool) = .empty,
+/// A press on an item, and where: a drag once the pointer moves away.
+drag_press: ?struct { at: [2]f32, item: usize } = null,
+/// What the drag out of this window carries, by full path.
+dragged: std.ArrayList([]u8) = .empty,
+/// A tab a drag is held over, and since when.
+drag_tab: ?usize = null,
+drag_tab_since: i64 = 0,
 /// A click on the one item chosen: its name to type anew, in a moment.
 rename_pending: ?usize = null,
 rename_pending_ms: i64 = 0,
@@ -182,6 +190,7 @@ pub fn init(self: *Files, gpa: std.mem.Allocator, io: std.Io, start: ?[]const u8
         .key = key,
         .button = pointerButton,
         .close = closeRequested,
+        .dropped = drag.dropped,
     });
     self.look_watch = Look.watch(io);
     if (self.look_watch) |fd| self.window.addWatch(.{ .fd = fd, .context = self, .ready = lookChanged });
@@ -229,6 +238,8 @@ pub fn deinit(self: *Files) void {
         _ = std.c.close(fd);
     };
     self.band_base.deinit(self.gpa);
+    for (self.dragged.items) |p| self.gpa.free(p);
+    self.dragged.deinit(self.gpa);
     nav.forget(self);
     if (self.crumb_list) |l| l.free(self.gpa);
     self.nav_opened.deinit(self.gpa);
@@ -770,6 +781,7 @@ fn draw(context: *anyopaque, window: *Window, kit: *Kit) void {
     menus.context(self, kit);
     menus.confirmDialog(self, kit);
     property_sheet.draw(self, kit);
+    drag.tip(self, kit);
     // A right or middle click on nothing that took it.
     self.context_at = null;
     self.middle_click = false;

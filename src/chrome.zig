@@ -20,6 +20,7 @@ const win11 = @import("win11.zig");
 const menus_mod = @import("menus.zig");
 const icons = @import("icons.zig");
 const nav = @import("nav.zig");
+const drag = @import("drag.zig");
 
 /// The surface the address row and the command bar are on - which the tab
 /// in front joins.
@@ -282,14 +283,17 @@ fn address(self: *Files, kit: *Kit) void {
                     crumbSeparator(self, kit, "crumb/sep/pc", "");
                 }
                 if (crumb(self, kit, "crumb/root", known.name)) to = .{ .folder = known.path };
+                drag.answerFolder(self, kit.ui, "crumb/root", known.path);
             } else if (within(path, home)) {
                 start = home.len;
                 root = home;
                 if (crumb(self, kit, "crumb/root", std.fs.path.basename(home))) to = .{ .folder = home };
+                drag.answerFolder(self, kit.ui, "crumb/root", home);
             } else {
                 if (crumb(self, kit, "crumb/pc", "This PC")) to = .this_pc;
                 crumbSeparator(self, kit, "crumb/sep/pc", "");
                 if (crumb(self, kit, "crumb/root", self.places.rootName())) to = .{ .folder = "/" };
+                drag.answerFolder(self, kit.ui, "crumb/root", "/");
             }
             var parts = std.mem.tokenizeScalar(u8, path[start..], '/');
             var n: usize = 0;
@@ -297,6 +301,7 @@ fn address(self: *Files, kit: *Kit) void {
             while (parts.next()) |part| : (n += 1) {
                 crumbSeparator(self, kit, kit.print("crumb/sep/{d}", .{n}), before);
                 const end = @intFromPtr(part.ptr) - @intFromPtr(path.ptr) + part.len;
+                drag.answerFolder(self, kit.ui, kit.print("crumb/{d}", .{n}), path[0..end]);
                 if (crumb(self, kit, kit.print("crumb/{d}", .{n}), part)) {
                     to = .{ .folder = std.fmt.bufPrint(&to_buffer, "{s}", .{path[0..end]}) catch path };
                 }

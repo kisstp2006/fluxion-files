@@ -30,6 +30,7 @@ const icons = @import("icons.zig");
 const menus = @import("menus.zig");
 const actions = @import("actions.zig");
 const win10 = @import("win10.zig");
+const drag = @import("drag.zig");
 
 const scroll_id = "view/scroll";
 
@@ -50,6 +51,7 @@ pub fn content(self: *Files, kit: *Kit) void {
     });
     defer u.close();
     renameDue(self);
+    drag.follow(self, kit);
     switch (t.location) {
         .home => homePage(self, kit),
         .this_pc => thisPcPage(self, kit),
@@ -175,6 +177,8 @@ fn pressedOn(self: *Files, u: *ui.Ui, i: usize) void {
         return;
     }
     pressed(self, i);
+    // Not a double click: perhaps the start of a drag.
+    if (self.window.clickCount() < 2) drag.pressed(self, i);
 }
 
 /// A name to type anew, asked for by a click on the one chosen, once no
@@ -313,6 +317,30 @@ fn listView(self: *Files, kit: *Kit) void {
         .tiles => lines(self, kit, .{ 280, 68 }, true),
     }
     rubberBand(self, kit);
+    answerDrop(self, u);
+}
+
+/// A drag over the list: into the folder under the pointer, or else into
+/// the folder shown - or, over the Recycle Bin, into it.
+fn answerDrop(self: *Files, u: *ui.Ui) void {
+    if (!self.window.dragOver() or !u.isPointerOver(scroll_id)) return;
+    const t = self.tab();
+    var buffer: [32]u8 = undefined;
+    for (0..t.count()) |i| {
+        const id = std.fmt.bufPrint(&buffer, "item/{d}", .{i}) catch continue;
+        if (!u.isPointerOver(id)) continue;
+        const e = t.entry(i);
+        if (!e.isFolder()) break;
+        const dir = t.dirOf(e) orelse break;
+        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const full = @import("Ops.zig").join(&path_buffer, dir, e.name) catch break;
+        return drag.answerFolder(self, u, id, full);
+    }
+    switch (t.location) {
+        .folder => |here| drag.answerFolder(self, u, scroll_id, here),
+        .trash => drag.answerTrash(self, u, scroll_id),
+        else => {},
+    }
 }
 
 /// Whether the pointer is on an item - by the last drawing.
@@ -941,9 +969,11 @@ fn homePage(self: *Files, kit: *Kit) void {
         defer u.close();
         for (self.places.user.items, 0..) |f, i| {
             if (placeTile(self, kit, kit.print("home/user/{d}", .{i}), icons.special(f.special), f.name, if (self.ten()) "This PC" else "Stored locally", true)) to = std.fmt.bufPrint(&to_buffer, "{s}", .{f.path}) catch null;
+            drag.answerFolder(self, u, kit.print("home/user/{d}", .{i}), f.path);
         }
         for (self.places.pinned.items, 0..) |f, i| {
             if (placeTile(self, kit, kit.print("home/pin/{d}", .{i}), "folder", f.name, std.fs.path.dirname(f.path) orelse "/", true)) to = std.fmt.bufPrint(&to_buffer, "{s}", .{f.path}) catch null;
+            drag.answerFolder(self, u, kit.print("home/pin/{d}", .{i}), f.path);
         }
     }
     if (!self.ten()) {
@@ -975,6 +1005,7 @@ fn thisPcPage(self: *Files, kit: *Kit) void {
         u.open(.{ .width = .grow, .wrap = true, .gap = 4, .wrap_gap = 4, .padding = .xy(8, 0) });
         for (self.places.user.items, 0..) |f, i| {
             if (placeTile(self, kit, kit.print("pc/user/{d}", .{i}), icons.special(f.special), f.name, "", false)) to = std.fmt.bufPrint(&to_buffer, "{s}", .{f.path}) catch null;
+            drag.answerFolder(self, u, kit.print("pc/user/{d}", .{i}), f.path);
         }
         u.close();
     }
@@ -982,6 +1013,7 @@ fn thisPcPage(self: *Files, kit: *Kit) void {
     u.open(.{ .width = .grow, .wrap = true, .gap = 4, .wrap_gap = 4, .padding = .xy(8, 0) });
     for (self.places.drives.items, 0..) |d, i| {
         if (driveTile(self, kit, kit.print("pc/drive/{d}", .{i}), d)) to = std.fmt.bufPrint(&to_buffer, "{s}", .{d.mount}) catch null;
+        drag.answerFolder(self, u, kit.print("pc/drive/{d}", .{i}), d.mount);
     }
     u.close();
     if (to) |path| self.goTo(.{ .folder = path });

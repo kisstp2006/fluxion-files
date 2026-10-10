@@ -37,6 +37,7 @@ const Kit = widgets.Kit;
 
 const ShmBuffer = @import("ShmBuffer.zig");
 const Icons = @import("Icons.zig");
+pub const Dnd = @import("Dnd.zig");
 
 const Window = @This();
 
@@ -61,6 +62,9 @@ pub const Content = struct {
     button: ?*const fn (context: *anyopaque, window: *Window, code: u32) bool = null,
     /// The window is closing: asked by its close button, or Alt+F4.
     close: ?*const fn (context: *anyopaque, window: *Window) void = null,
+    /// Files dropped on the window, where and as the drawing answered while
+    /// the drag was over it: see `answerDrop`.
+    dropped: ?*const fn (context: *anyopaque, window: *Window, paths: []const []const u8, answer: Dnd.Answer) void = null,
 };
 
 /// A kind of data offered on the clipboard, and the bytes of it.
@@ -106,6 +110,11 @@ data_manager: ?*wl.DataDeviceManager = null,
 data_device: ?*wl.DataDevice = null,
 selection_source: ?*wl.DataSource = null,
 selection: std.ArrayList(Offered) = .empty,
+/// Drags into the window and out of it. See `Dnd`.
+dnd: Dnd = .{},
+/// The serial of the last press of a pointer button: what a drag is
+/// started from.
+button_serial: u32 = 0,
 
 surface: *wl.Surface = undefined,
 xdg_surface: *xdg.Surface = undefined,
@@ -301,6 +310,7 @@ pub fn deinit(self: *Window) void {
     if (self.gpu) |g| g.deinit();
     if (self.frame_callback) |c| c.destroy();
     for (self.buffers) |maybe| if (maybe) |b| b.destroy(self.gpa);
+    self.dnd.deinit(self);
     self.dropSelection();
     self.selection.deinit(self.gpa);
     if (self.data_device) |d| d.release();
@@ -413,6 +423,49 @@ fn ensureDataDevice(self: *Window) void {
     const manager = self.data_manager orelse return;
     const seat = self.seat orelse return;
     self.data_device = manager.getDataDevice(seat) catch null;
+    if (self.data_device) |device| device.setListener(*Window, Dnd.deviceListener, self);
+}
+
+/// A drag is over the window at `x`, `y`: drawn as if the pointer were
+/// there, for the drawing to say what a drop there would do.
+pub fn dragAt(self: *Window, x: f32, y: f32) void {
+    self.pointer_at = .{ x, y };
+    self.down = false;
+    self.redraw();
+}
+
+/// The drag left, or was dropped.
+pub fn dragLeft(self: *Window) void {
+    self.pointer_at = null;
+    self.redraw();
+}
+
+/// Whether something is being dragged over the window, and whether it
+/// carries files.
+pub fn dragOver(self: *const Window) bool {
+    return self.dnd.carriesFiles();
+}
+
+/// Said while drawing, a drag over the window: a drop here would `action`
+/// into the folder `path`. Not said, it would do nothing.
+pub fn answerDrop(self: *Window, action: Dnd.Action, path: []const u8) void {
+    if (path.len > self.dnd.answer.path_buffer.len) return;
+    self.dnd.answer.action = action;
+    @memcpy(self.dnd.answer.path_buffer[0..path.len], path);
+    self.dnd.answer.path_len = path.len;
+}
+
+/// Files dropped, as answered: to the content.
+pub fn dropped(self: *Window, paths: []const []const u8, answer: Dnd.Answer) void {
+    if (self.content.dropped) |hook| hook(self.content.context, self, paths, answer);
+    self.redraw();
+}
+
+/// Start dragging `paths` out of the window, from the press that is down,
+/// `picture` under the pointer.
+pub fn startDrag(self: *Window, paths: []const []const u8, picture: ?raster.Image) void {
+    self.down = false;
+    self.dnd.start(self, paths, picture, self.button_serial);
 }
 
 /// Put `offers` on the clipboard - each kind with its bytes - as this
@@ -711,6 +764,9 @@ fn render(self: *Window) void {
     var commands: []const ui.RenderCommand = &.{};
     const s = self.scale;
     const laid_out = self.profile.start();
+    // A drag over the window: what a drop would do is what this drawing
+    // says.
+    self.dnd.answer = .{};
     // Twice: hover and press are answered from the drawing before.
     for (0..2) |pass| {
         const down = self.down or (pass == 0 and self.pressed_since_drawn);
@@ -729,6 +785,7 @@ fn render(self: *Window) void {
     }
     self.pressed_since_drawn = false;
     self.profile.stop(.layout, laid_out);
+    self.dnd.tell();
     const again = self.input_since_drawn;
     self.input_since_drawn = false;
 
@@ -877,7 +934,10 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, self: *Window) void 
             self.redraw();
         },
         .button => |button| {
-            if (button.state == .pressed) self.last_serial = button.serial;
+            if (button.state == .pressed) {
+                self.last_serial = button.serial;
+                self.button_serial = button.serial;
+            }
             if (button.button != button_left) {
                 if (button.state == .pressed) if (self.content.button) |hook| {
                     if (hook(self.content.context, self, button.button)) self.redraw();

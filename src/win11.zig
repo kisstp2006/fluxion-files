@@ -19,6 +19,7 @@ const Color = ui.Color;
 const Files = @import("Files.zig");
 const Window = @import("Window.zig");
 const actions = @import("actions.zig");
+const drag = @import("drag.zig");
 const chrome = @import("chrome.zig");
 
 /// The title bar's height, the tabs at its foot.
@@ -44,6 +45,8 @@ pub fn titleBar(self: *Files, kit: *Kit) void {
             const id = kit.print("tab/{d}", .{i});
             const front = i == self.active;
             const hovered = u.isPointerOver(id);
+            // A drag held over a tab brings it to the front.
+            drag.overTab(self, u, id, i);
             // Between two tabs neither in front: a thin line, as Windows'.
             if (i > 0 and !front and i - 1 != self.active) {
                 u.empty(.{ .width = .fixed(1), .height = .fixed(16), .background_color = p.divider });
