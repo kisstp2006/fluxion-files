@@ -167,18 +167,19 @@ fn isTrashed(path: []const u8) bool {
 pub fn actionFor(self: *Files, to: []const u8) Dnd.Action {
     const ctrl = self.window.modifierHeld("Control");
     const shift = self.window.modifierHeld("Shift");
-    // From another program: what it dragged is not known here until it is
-    // dropped. Copied, unless Shift says move.
-    if (!self.window.dnd.dragging()) return if (shift) .move else .copy;
+    // From another program: what it dragged, once it has been read; until
+    // then, copied unless Shift says move.
+    const dragged: []const []const u8 = if (self.window.dnd.dragging()) @ptrCast(self.dragged.items) else self.window.dnd.paths() orelse return if (shift) .move else .copy;
+    if (dragged.len == 0) return .none;
     var all_here = true;
-    for (self.dragged.items) |p| {
+    for (dragged) |p| {
         if (Ops.isInside(to, p)) return .none;
         if (!std.mem.eql(u8, std.fs.path.dirname(p) orelse "/", to)) all_here = false;
     }
     if (all_here) return if (ctrl) .copy else .none;
     if (ctrl) return .copy;
     if (shift) return .move;
-    const from_device = if (self.dragged.items.len > 0) Ops.deviceOf(self.dragged.items[0]) else null;
+    const from_device = Ops.deviceOf(dragged[0]);
     const to_device = Ops.deviceOf(to);
     if (from_device != null and to_device != null and from_device.? == to_device.?) return .move;
     return .copy;

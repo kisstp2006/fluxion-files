@@ -55,14 +55,13 @@ const In = struct {
     told: Action = .none,
     told_set: bool = false,
     dropped: bool = false,
-};
-
-/// A drop being read: the pipe's end, what came so far, and where it goes.
-const Reading = struct {
-    offer: *wl.DataOffer,
-    fd: std.c.fd_t,
+    /// Its URIs, asked for as it came and being read; then its paths -
+    /// what a drop here is decided on.
+    fd: std.c.fd_t = -1,
     bytes: std.ArrayList(u8) = .empty,
-    answer: Answer,
+    paths: ?[][]u8 = null,
+    /// What the drawing answered when it was dropped.
+    answer: Answer = .{},
 };
 
 /// A drag this window started: what it offers, and the picture under the
@@ -85,7 +84,6 @@ const Pending = struct {
 
 pending: std.ArrayList(*Pending) = .empty,
 in: ?In = null,
-reading: ?Reading = null,
 out: ?Out = null,
 /// What the drawing that just finished answered, and whether it was asked.
 answer: Answer = .{},
@@ -96,8 +94,7 @@ pub fn deinit(self: *Dnd, window: *Window) void {
         window.gpa.destroy(p);
     }
     self.pending.deinit(window.gpa);
-    if (self.in) |in| if (!in.dropped) in.offer.destroy();
-    if (self.reading) |*r| self.endReading(window, r, false);
+    self.endIn(window);
     self.endOut(window);
 }
 
@@ -128,8 +125,9 @@ pub fn deviceListener(device: *wl.DataDevice, event: wl.DataDevice.Event, window
             const offer = enter.id orelse return;
             const p = self.take(window, offer) orelse return;
             defer window.gpa.destroy(p);
-            if (self.in) |old| if (!old.dropped) old.offer.destroy();
+            self.endIn(window);
             self.in = .{ .offer = offer, .serial = enter.serial, .uris = p.uris, .source_actions = p.actions };
+            self.peek(window);
             window.dragAt(@floatCast(enter.x.toDouble()), @floatCast(enter.y.toDouble()));
         },
         .motion => |motion| {
@@ -137,8 +135,9 @@ pub fn deviceListener(device: *wl.DataDevice, event: wl.DataDevice.Event, window
             window.dragAt(@floatCast(motion.x.toDouble()), @floatCast(motion.y.toDouble()));
         },
         .leave => {
-            if (self.in) |in| if (!in.dropped) in.offer.destroy();
-            self.in = null;
+            const in = self.in orelse return;
+            if (in.dropped) return;
+            self.endIn(window);
             window.dragLeft();
         },
         .drop => self.drop(window),
@@ -173,7 +172,43 @@ fn take(self: *Dnd, window: *Window, offer: *wl.DataOffer) ?*Pending {
 /// Whether the drag over the window carries files.
 pub fn carriesFiles(self: *const Dnd) bool {
     const in = self.in orelse return false;
-    return in.uris;
+    return in.uris and !in.dropped;
+}
+
+/// What is dragged over the window, by path, once it has been read.
+pub fn paths(self: *const Dnd) ?[]const []const u8 {
+    const in = self.in orelse return null;
+    const all = in.paths orelse return null;
+    return @ptrCast(all);
+}
+
+/// Ask for the URIs as soon as the drag is here: a drop here is then
+/// decided on what it is.
+fn peek(self: *Dnd, window: *Window) void {
+    const in = &(self.in orelse return);
+    if (!in.uris) return;
+    var fds: [2]std.c.fd_t = undefined;
+    if (std.c.pipe2(&fds, .{ .CLOEXEC = true, .NONBLOCK = true }) != 0) return;
+    in.offer.receive("text/uri-list", fds[1]);
+    _ = std.c.close(fds[1]);
+    in.fd = fds[0];
+    window.addWatch(.{ .fd = fds[0], .context = window, .ready = readable });
+}
+
+/// The drag over the window let go of: its offer, what was read of it.
+fn endIn(self: *Dnd, window: *Window) void {
+    var in = self.in orelse return;
+    if (in.fd >= 0) {
+        window.removeWatch(in.fd);
+        _ = std.c.close(in.fd);
+    }
+    in.bytes.deinit(window.gpa);
+    if (in.paths) |all| {
+        for (all) |p| window.gpa.free(p);
+        window.gpa.free(all);
+    }
+    in.offer.destroy();
+    self.in = null;
 }
 
 /// Tell the dragging app what the last drawing answered, if it changed.
@@ -201,69 +236,53 @@ pub fn tell(self: *Dnd) void {
 fn drop(self: *Dnd, window: *Window) void {
     const in = &(self.in orelse return);
     in.dropped = true;
-    const answer = self.answer;
-    if (answer.action == .none or !in.uris or self.reading != null) {
-        in.offer.destroy();
-        self.in = null;
-        window.dragLeft();
-        return;
-    }
-    var fds: [2]std.c.fd_t = undefined;
-    if (std.c.pipe2(&fds, .{ .CLOEXEC = true, .NONBLOCK = true }) != 0) {
-        in.offer.destroy();
-        self.in = null;
-        return;
-    }
-    in.offer.receive("text/uri-list", fds[1]);
-    _ = std.c.close(fds[1]);
-    self.reading = .{ .offer = in.offer, .fd = fds[0], .answer = answer };
-    self.in = null;
-    window.addWatch(.{ .fd = fds[0], .context = window, .ready = readable });
+    in.answer = self.answer;
     window.dragLeft();
+    if (in.answer.action == .none or !in.uris) return self.endIn(window);
+    // Read already: handed over now; or once it has all come.
+    if (in.paths != null) self.deliver(window);
 }
 
-/// More of a drop has come: read; all of it, handed to the content.
+/// More of the URIs have come: read; all of them, made paths.
 fn readable(context: *anyopaque) void {
     const window: *Window = @ptrCast(@alignCast(context));
     const self = &window.dnd;
-    const r = &(self.reading orelse return);
+    const in = &(self.in orelse return);
     var buffer: [4096]u8 = undefined;
     while (true) {
-        const n = std.c.read(r.fd, &buffer, buffer.len);
+        const n = std.c.read(in.fd, &buffer, buffer.len);
         if (n > 0) {
-            r.bytes.appendSlice(window.gpa, buffer[0..@intCast(n)]) catch {
-                self.endReading(window, r, false);
-                return;
-            };
+            in.bytes.appendSlice(window.gpa, buffer[0..@intCast(n)]) catch break;
             continue;
         }
         if (n < 0 and std.posix.errno(n) == .AGAIN) return;
         break;
     }
-    self.endReading(window, r, true);
+    window.removeWatch(in.fd);
+    _ = std.c.close(in.fd);
+    in.fd = -1;
+    var found: std.ArrayList([]u8) = .empty;
+    var lines = std.mem.tokenizeAny(u8, in.bytes.items, "\r\n");
+    while (lines.next()) |line| {
+        if (line.len == 0 or line[0] == '#') continue;
+        const path = pathOfUri(window.gpa, line) orelse continue;
+        found.append(window.gpa, path) catch window.gpa.free(path);
+    }
+    in.paths = found.toOwnedSlice(window.gpa) catch blk: {
+        for (found.items) |p| window.gpa.free(p);
+        found.deinit(window.gpa);
+        break :blk &.{};
+    };
+    if (in.dropped) self.deliver(window) else window.redraw();
 }
 
-fn endReading(self: *Dnd, window: *Window, r: *Reading, done: bool) void {
-    window.removeWatch(r.fd);
-    _ = std.c.close(r.fd);
-    if (done) {
-        var paths: std.ArrayList([]const u8) = .empty;
-        defer {
-            for (paths.items) |p| window.gpa.free(p);
-            paths.deinit(window.gpa);
-        }
-        var lines = std.mem.tokenizeAny(u8, r.bytes.items, "\r\n");
-        while (lines.next()) |line| {
-            if (line.len == 0 or line[0] == '#') continue;
-            const path = pathOfUri(window.gpa, line) orelse continue;
-            paths.append(window.gpa, path) catch window.gpa.free(path);
-        }
-        if (paths.items.len > 0) window.dropped(paths.items, r.answer);
-        r.offer.finish();
-    }
-    r.offer.destroy();
-    r.bytes.deinit(window.gpa);
-    self.reading = null;
+/// The drop, its paths read: to the content, and the offer finished.
+fn deliver(self: *Dnd, window: *Window) void {
+    const in = &(self.in orelse return);
+    const all = in.paths orelse return;
+    if (all.len > 0) window.dropped(@ptrCast(all), in.answer);
+    in.offer.finish();
+    self.endIn(window);
 }
 
 /// The path a `file://` URI names, its `%XX` undone; null for any other.
@@ -298,16 +317,16 @@ pub fn pathOfUri(gpa: std.mem.Allocator, uri: []const u8) ?[]u8 {
 // Out of the window
 // -------------------------------------------------------------------------
 
-/// Start dragging `paths` out from the press with `serial`, `picture` - if
+/// Start dragging `files` out from the press with `serial`, `picture` - if
 /// any - under the pointer.
-pub fn start(self: *Dnd, window: *Window, paths: []const []const u8, picture: ?raster.Image, serial: u32) void {
+pub fn start(self: *Dnd, window: *Window, files: []const []const u8, picture: ?raster.Image, serial: u32) void {
     const manager = window.data_manager orelse return;
     const device = window.data_device orelse return;
-    if (paths.len == 0) return;
+    if (files.len == 0) return;
     self.endOut(window);
     var uri_list: std.ArrayList(u8) = .empty;
     var text: std.ArrayList(u8) = .empty;
-    for (paths, 0..) |p, i| {
+    for (files, 0..) |p, i| {
         appendUri(window.gpa, &uri_list, p) catch {};
         uri_list.appendSlice(window.gpa, "\r\n") catch {};
         if (i > 0) text.append(window.gpa, '\n') catch {};
