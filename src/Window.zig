@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: BSD-2-Clause
 
 //! A window Files is drawn in: an xdg-shell toplevel, and what is in it
-//! drawn with Fluxion UI's CPU renderer into shared memory, as the desktop's
-//! own shell draws its panels.
+//! drawn on the GPU - Fluxion UI's GPU renderer, through Vulkan, onto the
+//! surface - or, where there is none, with its CPU renderer into shared
+//! memory.
 //!
 //! **Its title bar is its own in Windows 11's look** - the tabs are in it -
 //! drawn with the very `Kit.titleBar` the compositor draws its own with,
@@ -31,6 +32,7 @@ const xkb = @import("xkbcommon");
 const ui = @import("fluxion_ui");
 const raster = @import("fluxion_ui_raster");
 const widgets = @import("fluxion_widgets");
+const gpu_mod = @import("fluxion_widgets_gpu");
 const Kit = widgets.Kit;
 
 const ShmBuffer = @import("ShmBuffer.zig");
@@ -123,6 +125,12 @@ theme: widgets.Theme,
 font_files: widgets.Fonts.Files,
 fonts: widgets.Fonts = undefined,
 painter: raster.Renderer = undefined,
+/// The GPU it draws on, and its surface's swapchain there; null to draw on
+/// the CPU - no Vulkan, or the surface could not be drawn on with it.
+gpu: ?*gpu_mod.Gpu = null,
+target: ?gpu_mod.Target = null,
+/// `FLUXION_PROFILE`: how long laying out and drawing take, said a second.
+profile: Profile = .{},
 icons: Icons = undefined,
 layout: ui.Ui,
 
@@ -201,6 +209,8 @@ pub fn init(self: *Window, gpa: std.mem.Allocator, io: std.Io, title: [:0]const 
     self.painter = try .init(gpa, &self.fonts.text);
     const faces = self.fonts.faces();
     try self.painter.setFaces(&faces);
+    self.gpu = gpu_mod.Gpu.open(gpa, &faces, &.{}) catch null;
+    self.profile.on = std.c.getenv("FLUXION_PROFILE") != null;
     self.icons = .init(gpa, io, null);
     self.layout.setMeasurer(self.fonts.measurer());
     self.xkb_context = xkb.Context.new(.no_flags);
@@ -282,6 +292,8 @@ pub fn clickCount(self: *const Window) u8 {
 }
 
 pub fn deinit(self: *Window) void {
+    if (self.target) |*t| t.deinit();
+    if (self.gpu) |g| g.deinit();
     if (self.frame_callback) |c| c.destroy();
     for (self.buffers) |maybe| if (maybe) |b| b.destroy(self.gpa);
     self.dropSelection();
@@ -622,9 +634,34 @@ fn freeBuffer(self: *Window) ?*ShmBuffer {
     return null;
 }
 
+/// The surface's swapchain on the GPU, made the first time; null to draw
+/// on the CPU.
+fn gpuTarget(self: *Window, pw: u32, ph: u32) ?*gpu_mod.Target {
+    const gpu = self.gpu orelse return null;
+    if (self.target == null) {
+        self.target = gpu_mod.Target.init(gpu, @ptrCast(self.display), @ptrCast(self.surface), pw, ph, .see_through) catch |err| {
+            log.warn("could not draw on the GPU ({t}): drawing on the CPU", .{err});
+            self.dropGpu();
+            return null;
+        };
+    }
+    return &self.target.?;
+}
+
+/// Give the GPU up for the CPU: what draws next attaches shared memory.
+fn dropGpu(self: *Window) void {
+    if (self.target) |*t| t.deinit();
+    self.target = null;
+    if (self.gpu) |g| g.deinit();
+    self.gpu = null;
+    self.painted = null;
+}
+
 fn render(self: *Window) void {
     if (self.width == 0 or self.height == 0) return;
-    const buffer = self.freeBuffer() orelse return;
+    const pw, const ph = self.pixelSize();
+    const target = self.gpuTarget(pw, ph);
+    const buffer: ?*ShmBuffer = if (target == null) (self.freeBuffer() orelse return) else null;
     self.dirty = false;
     self.rendering = true;
     defer self.rendering = false;
@@ -637,6 +674,7 @@ fn render(self: *Window) void {
     var kit: Kit = .init(&self.layout, &self.theme);
     var commands: []const ui.RenderCommand = &.{};
     const s = self.scale;
+    const laid_out = self.profile.start();
     // Twice: hover and press are answered from the drawing before.
     for (0..2) |pass| {
         const down = self.down or (pass == 0 and self.pressed_since_drawn);
@@ -645,7 +683,7 @@ fn render(self: *Window) void {
         } else {
             self.layout.setPointer(-1000, -1000, false);
         }
-        self.layout.begin(.{ .size = .init(@floatFromInt(buffer.width), @floatFromInt(buffer.height)), .scale = s, .rounding = self.theme.look.rounding() });
+        self.layout.begin(.{ .size = .init(@floatFromInt(pw), @floatFromInt(ph)), .scale = s, .rounding = self.theme.look.rounding() });
         kit.frame();
         self.content.draw(self.content.context, self, &kit);
         commands = self.layout.end() catch |err| {
@@ -654,6 +692,7 @@ fn render(self: *Window) void {
         };
     }
     self.pressed_since_drawn = false;
+    self.profile.stop(.layout, laid_out);
     const again = self.input_since_drawn;
     self.input_since_drawn = false;
 
@@ -661,7 +700,7 @@ fn render(self: *Window) void {
     const clear: ui.Color = if (self.mica or self.acrylic) .transparent else self.theme.palette.solid_base;
     // Nothing drawn differently: nothing painted, nothing handed over. Asked
     // to look again, it hears of the next frame all the same.
-    const hash = hashCommands(commands, buffer.width, buffer.height, self.icons.generation, clear);
+    const hash = hashCommands(commands, pw, ph, self.icons.generation, clear);
     if (self.painted == hash) {
         if (again) {
             self.dirty = true;
@@ -674,22 +713,38 @@ fn render(self: *Window) void {
         return;
     }
     self.painted = hash;
-    self.painter.setImages(self.icons.images.items);
-    self.painter.draw(.init(buffer.pixels, buffer.width, buffer.height), commands, clear) catch |err| {
-        log.err("could not draw: {t}", .{err});
-    };
-    self.surface.attach(buffer.wl_buffer, 0, 0);
+    const drawn = self.profile.start();
+    // What goes with the picture, whichever draws it: the size it is shown
+    // at, and the next frame asked for. On the GPU the swapchain's present
+    // commits them with its buffer.
     if (self.viewport) |viewport| if (self.shown_size[0] != self.width or self.shown_size[1] != self.height) {
         viewport.setDestination(@intCast(self.width), @intCast(self.height));
         self.shown_size = .{ self.width, self.height };
     };
-    self.surface.damageBuffer(0, 0, @intCast(buffer.width), @intCast(buffer.height));
     if (self.surface.frame()) |callback| {
         callback.setListener(*Window, frameListener, self);
         self.frame_callback = callback;
     } else |_| {}
-    buffer.busy = true;
-    self.surface.commit();
+    if (target) |t| {
+        self.gpu.?.setImages(self.icons.images.items);
+        t.present(commands, pw, ph, clear) catch |err| {
+            log.warn("could not draw on the GPU ({t}): drawing on the CPU", .{err});
+            self.dropGpu();
+            self.dirty = true;
+            return;
+        };
+        self.profile.stop(.gpu, drawn);
+    } else if (buffer) |b| {
+        self.painter.setImages(self.icons.images.items);
+        self.painter.draw(.init(b.pixels, b.width, b.height), commands, clear) catch |err| {
+            log.err("could not draw: {t}", .{err});
+        };
+        self.surface.attach(b.wl_buffer, 0, 0);
+        self.surface.damageBuffer(0, 0, @intCast(b.width), @intCast(b.height));
+        b.busy = true;
+        self.surface.commit();
+        self.profile.stop(.cpu, drawn);
+    }
     if (again) self.dirty = true;
 }
 
@@ -904,3 +959,48 @@ pub fn nowMs() i64 {
     _ = std.c.clock_gettime(.MONOTONIC, &ts);
     return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
 }
+
+/// How long a window's drawing takes, with `FLUXION_PROFILE=1`: a line a
+/// second, each kind of work with how often it ran, its average and its
+/// most. Off, it costs a branch.
+const Profile = struct {
+    on: bool = false,
+    tallies: std.EnumArray(What, Tally) = .initFill(.{}),
+    since_ns: u64 = 0,
+
+    const What = enum { layout, gpu, cpu };
+    const Tally = struct { count: u32 = 0, total_ns: u64 = 0, max_ns: u64 = 0 };
+
+    fn start(self: *const Profile) u64 {
+        return if (self.on) monotonicNs() else 0;
+    }
+
+    fn stop(self: *Profile, what: What, started: u64) void {
+        if (!self.on) return;
+        const t = monotonicNs();
+        const tally = self.tallies.getPtr(what);
+        tally.count += 1;
+        tally.total_ns += t -| started;
+        tally.max_ns = @max(tally.max_ns, t -| started);
+        if (self.since_ns == 0) self.since_ns = t;
+        if (t - self.since_ns < std.time.ns_per_s) return;
+        var buffer: [256]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buffer);
+        for (std.enums.values(What)) |kind| {
+            const k = self.tallies.get(kind);
+            if (k.count == 0) continue;
+            const avg = @as(f64, @floatFromInt(k.total_ns)) / @as(f64, @floatFromInt(k.count)) / std.time.ns_per_ms;
+            const most = @as(f64, @floatFromInt(k.max_ns)) / std.time.ns_per_ms;
+            w.print("{t} {d}x {d:.2} ms (max {d:.2})  ", .{ kind, k.count, avg, most }) catch {};
+        }
+        log.info("{s}", .{w.buffered()});
+        self.tallies = .initFill(.{});
+        self.since_ns = t;
+    }
+
+    fn monotonicNs() u64 {
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(.MONOTONIC, &ts);
+        return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+    }
+};
