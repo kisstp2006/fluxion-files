@@ -694,19 +694,27 @@ pub fn showMenu(self: *Files, kit: *Kit) void {
     }
 }
 
-const columns = [_]struct { by: Folder.Column, name: []const u8 }{
-    .{ .by = .name, .name = "Name" },
-    .{ .by = .modified, .name = "Date modified" },
-    .{ .by = .type, .name = "Type" },
-    .{ .by = .size, .name = "Size" },
-};
+/// What Sort by and Group by offer, as Windows' do: Name, Date modified,
+/// Type and Size, and the other columns Details shows.
+pub fn sortable(t: *const Tab, out: *[Folder.column_count]Folder.Column) []const Folder.Column {
+    var n: usize = 0;
+    inline for (@typeInfo(Folder.Column).@"enum".fields) |f| {
+        const c: Folder.Column = @enumFromInt(f.value);
+        if (f.value < 4 or t.columns & (@as(u16, 1) << f.value) != 0) {
+            out[n] = c;
+            n += 1;
+        }
+    }
+    return out[0..n];
+}
 
 fn sortMenu(self: *Files, kit: *Kit) void {
     const t = self.tab();
-    for (columns) |c| if (row(self, kit, kit.print("context/sort/{t}", .{c.by}), c.name, .{ .marked = t.sort_by == c.by })) {
+    var list: [Folder.column_count]Folder.Column = undefined;
+    for (sortable(t, &list)) |by| if (row(self, kit, kit.print("context/sort/{t}", .{by}), @import("views.zig").colName(@import("views.zig").colOfColumn(by)), .{ .marked = t.sort_by == by })) {
         done(self);
         // Chosen again it keeps its order.
-        if (t.sort_by != c.by) self.sortBy(c.by);
+        if (t.sort_by != by) self.sortBy(by);
         return;
     };
     separator(self, kit);
@@ -722,9 +730,10 @@ fn sortMenu(self: *Files, kit: *Kit) void {
 
 fn groupMenu(self: *Files, kit: *Kit) void {
     const t = self.tab();
-    for (columns) |c| if (row(self, kit, kit.print("context/group/{t}", .{c.by}), c.name, .{ .marked = t.group_by == c.by })) {
+    var list: [Folder.column_count]Folder.Column = undefined;
+    for (sortable(t, &list)) |by| if (row(self, kit, kit.print("context/group/{t}", .{by}), @import("views.zig").colName(@import("views.zig").colOfColumn(by)), .{ .marked = t.group_by == by })) {
         done(self);
-        return self.groupBy(c.by);
+        return self.groupBy(by);
     };
     separator(self, kit);
     if (row(self, kit, "context/group/none", "(None)", .{ .marked = t.group_by == null })) {

@@ -258,61 +258,111 @@ fn checkBox(self: *Files, kit: *Kit, i: usize, shown: bool) void {
 // A list: a folder, a search's findings, the Recycle Bin
 // -------------------------------------------------------------------------
 
-/// The columns of Details, for what is shown.
-const Col = enum { name, modified, type, size, folder, original, deleted };
+/// The columns of Details, for what is shown: a folder's own - those of
+/// `Folder.Column` it shows - a search's with where each was found, the
+/// Recycle Bin's with where each was and when it went.
+pub const Col = enum { name, modified, type, size, created, accessed, attributes, owner, folder, original, deleted };
 
-fn columnsOf(t: *const Tab) []const Col {
-    return switch (t.location) {
-        .search => &.{ .name, .modified, .type, .size, .folder },
-        .trash => &.{ .name, .original, .deleted, .size, .type, .modified },
-        else => &.{ .name, .modified, .type, .size },
-    };
+/// The column a `Folder.Column` is shown as.
+pub fn colOfColumn(c: Folder.Column) Col {
+    return colOf(c);
 }
 
-fn colName(c: Col) []const u8 {
+fn colOf(c: Folder.Column) Col {
     return switch (c) {
-        .name => "Name",
-        .modified => "Date modified",
-        .type => "Type",
-        .size => "Size",
-        .folder => "Folder",
-        .original => "Original Location",
-        .deleted => "Date Deleted",
+        .name => .name,
+        .modified => .modified,
+        .type => .type,
+        .size => .size,
+        .created => .created,
+        .accessed => .accessed,
+        .attributes => .attributes,
+        .owner => .owner,
     };
 }
 
-fn colWidth(c: Col) ?f32 {
-    return switch (c) {
-        .name => null,
-        .modified, .deleted => 150,
-        .type => 150,
-        .size => 90,
-        .folder, .original => 220,
-    };
-}
-
-/// A column's width: Name takes what is left, never less than a name
-/// needs; the others give way down to about half, as a narrow window
-/// squeezes them.
-fn colSizing(c: Col) ui.layout.Sizing {
-    const w = colWidth(c) orelse return .growWith(.{ .min = 160 });
-    return .fixedDownTo(w, w * 0.55);
-}
-
+/// The `Folder.Column` a column is - what it sorts by, and where its width
+/// is kept - if it is one.
 fn colSort(c: Col) ?Folder.Column {
     return switch (c) {
         .name => .name,
         .modified => .modified,
         .type => .type,
         .size => .size,
+        .created => .created,
+        .accessed => .accessed,
+        .attributes => .attributes,
+        .owner => .owner,
         else => null,
     };
+}
+
+pub fn columnsOf(t: *const Tab, buffer: *[12]Col) []const Col {
+    if (t.location == .trash) return &.{ .name, .original, .deleted, .size, .type, .modified };
+    var n: usize = 0;
+    inline for (@typeInfo(Folder.Column).@"enum".fields) |f| {
+        const c: Folder.Column = @enumFromInt(f.value);
+        if (c == .name or t.columns & (@as(u16, 1) << f.value) != 0) {
+            buffer[n] = colOf(c);
+            n += 1;
+        }
+    }
+    if (t.location == .search) {
+        buffer[n] = .folder;
+        n += 1;
+    }
+    return buffer[0..n];
+}
+
+pub fn colName(c: Col) []const u8 {
+    return switch (c) {
+        .name => "Name",
+        .modified => "Date modified",
+        .type => "Type",
+        .size => "Size",
+        .created => "Date created",
+        .accessed => "Date accessed",
+        .attributes => "Attributes",
+        .owner => "Owner",
+        .folder => "Folder",
+        .original => "Original Location",
+        .deleted => "Date Deleted",
+    };
+}
+
+/// A column's own width; Name's is what is left.
+fn colWidth(c: Col) ?f32 {
+    return switch (c) {
+        .name => null,
+        .modified, .deleted, .created, .accessed => 150,
+        .type => 150,
+        .size => 90,
+        .attributes => 80,
+        .owner => 110,
+        .folder, .original => 220,
+    };
+}
+
+/// A column's width: as wide as it was dragged to; else Name takes what is
+/// left, never less than a name needs, and the others give way down to
+/// about half, as a narrow window squeezes them.
+fn colSizing(t: *const Tab, c: Col) ui.layout.Sizing {
+    if (colSort(c)) |s| {
+        const w = t.widths[@intFromEnum(s)];
+        if (w > 0) return .fixed(@floatFromInt(w));
+    }
+    const w = colWidth(c) orelse return .growWith(.{ .min = 160 });
+    return .fixedDownTo(w, w * 0.55);
 }
 
 fn listView(self: *Files, kit: *Kit) void {
     const u = kit.ui;
     const p = &kit.theme.palette;
     const t = self.tab();
+    if (self.fit_columns) {
+        self.fit_columns = false;
+        fitAllColumns(self, kit);
+    }
     noticeBar(self, kit);
     if (t.view == .details) detailsHeader(self, kit);
     u.open(.{
@@ -642,8 +692,9 @@ fn detailsHeader(self: *Files, kit: *Kit) void {
     const p = &kit.theme.palette;
     const t = self.tab();
     const ten = self.ten();
+    const header_id = "details/header";
     u.open(.{
-        .id = "details/header",
+        .id = header_id,
         .width = .grow,
         .height = .fixed(if (ten) 25 else 32),
         .padding = .trbl(0, if (ten) 0 else 16, 0, if (ten) 0 else 16),
@@ -652,12 +703,13 @@ fn detailsHeader(self: *Files, kit: *Kit) void {
     });
     defer u.close();
     if (self.check_boxes) u.empty(.{ .width = .fixed(24) });
-    for (columnsOf(t)) |c| {
+    var buffer: [12]Col = undefined;
+    for (columnsOf(t, &buffer)) |c| {
         const id = kit.print("details/column/{t}", .{c});
         const hovered = u.isPointerOver(id);
         u.open(.{
             .id = id,
-            .width = colSizing(c),
+            .width = colSizing(t, c),
             .height = .grow,
             .padding = .xy(if (ten) 6 else 8, 0),
             .gap = 4,
@@ -671,10 +723,223 @@ fn detailsHeader(self: *Files, kit: *Kit) void {
         var style = kit.style(.caption, if (ten) (if (p.mode == .dark) widgets.argb(0xFFB0B0B0) else widgets.argb(0xFF4C607A)) else p.text_secondary);
         style.wrap = .none;
         u.text(colName(c), style);
-        if (colSort(c)) |s| if (t.sort_by == s) kit.icon(if (t.ascending) .chevron_up else .chevron_down, 8, p.text_secondary, .regular);
-        if (u.justReleased()) if (colSort(c)) |s| self.sortBy(s);
+        // The column sorted by: a small chevron over its name's middle, as
+        // Windows marks it.
+        if (colSort(c)) |s| if (t.sort_by == s) {
+            u.open(.{ .floating = .{ .attach = .parent, .fractions = .{ .element_x = 0.5, .element_y = 0, .target_x = 0.5, .target_y = 0 }, .offset = .{ .x = 0, .y = if (ten) -1 else 1 } }, .passthrough = true });
+            kit.icon(if (t.ascending) .chevron_up else .chevron_down, 8, p.text_secondary, .regular);
+            u.close();
+        };
+        if (u.justReleased() and self.col_drag == null) if (colSort(c)) |s| self.sortBy(s);
+        columnGrip(self, kit, t, c, id);
         u.close();
     }
+    // A right click on the heads: which columns, and their widths.
+    if (self.context_at) |at| if (u.isPointerOver(header_id) or u.isPointerWithin(header_id)) {
+        self.menu = .columns;
+        self.columns_at = at;
+        self.columns_col = null;
+        for (columnsOf(t, &buffer)) |c| if (u.isPointerWithin(kit.print("details/column/{t}", .{c}))) {
+            self.columns_col = colSort(c);
+        };
+        self.context_at = null;
+    };
+    // Dragged: the column as wide as the pointer says, kept once let go.
+    if (self.col_drag) |drag_state| {
+        u.setCursor(.resize_ew);
+        if (!self.window.down) {
+            self.col_drag = null;
+            self.folder_views.remember(self.io, t);
+        } else if (self.window.pointer_at) |ptr| {
+            t.widths[drag_state.col] = @intFromFloat(@max(40, drag_state.from_width + ptr[0] - drag_state.from_x));
+        }
+    }
+}
+
+/// The edge at a column head's right: dragged, the column wider or
+/// narrower; double-clicked, as wide as what is in it.
+fn columnGrip(self: *Files, kit: *Kit, t: *Tab, c: Col, cell_id: []const u8) void {
+    const u = kit.ui;
+    const s = colSort(c) orelse return;
+    const id = kit.print("details/grip/{t}", .{c});
+    u.open(.{
+        .id = id,
+        .width = .fixed(8),
+        .height = .grow,
+        .cursor = .resize_ew,
+        .floating = .{ .attach = .parent, .fractions = .{ .element_x = 0.5, .element_y = 0, .target_x = 1, .target_y = 0 }, .z_index = 3 },
+    });
+    defer u.close();
+    if (!u.justPressed()) return;
+    if (self.window.clickCount() >= 2) {
+        self.col_drag = null;
+        fitColumn(self, kit, t, c);
+        self.folder_views.remember(self.io, t);
+        return;
+    }
+    const box = self.window.boxOf(cell_id) orelse return;
+    const at = self.window.pointer_at orelse return;
+    self.col_drag = .{ .col = @intFromEnum(s), .from_x = at[0], .from_width = box.width };
+}
+
+/// A column as wide as the widest thing in it - and its name.
+pub fn fitColumn(self: *Files, kit: *Kit, t: *Tab, c: Col) void {
+    const s = colSort(c) orelse return;
+    const m = kit.ui.measurer orelse return;
+    const style = kit.style(.caption, kit.theme.palette.text_primary);
+    var widest = m.measure(colName(c), style).width + 24;
+    const n = @min(t.count(), 4000);
+    for (0..n) |i| {
+        var buffer: [256]u8 = undefined;
+        const e = t.entry(i);
+        const text = cellText(self, e, c, &buffer);
+        var w = m.measure(text, style).width + 20;
+        if (c == .name) w += 16 + 8 + 4;
+        widest = @max(widest, w);
+    }
+    t.widths[@intFromEnum(s)] = @intFromFloat(@min(800, @ceil(widest)));
+}
+
+/// "Size all columns to fit" (Ctrl+Numpad +).
+pub fn fitAllColumns(self: *Files, kit: *Kit) void {
+    const t = self.tab();
+    var buffer: [12]Col = undefined;
+    for (columnsOf(t, &buffer)) |c| fitColumn(self, kit, t, c);
+    self.folder_views.remember(self.io, t);
+}
+
+/// The heads' menu - and Windows 10's Add columns: the columns, ticked
+/// where shown; sized to fit, one or all; More... for the dialog.
+pub fn columnsMenu(self: *Files, kit: *Kit) void {
+    const u = kit.ui;
+    if (self.window.down and !u.isPointerOver("menu/columns") and !u.isPointerOver("ribbon/columns")) {
+        self.menu = .none;
+        return;
+    }
+    const t = self.tab();
+    const floating: ui.layout.Floating = if (self.columns_at) |at|
+        .{ .attach = .root, .offset = .{ .x = at[0], .y = at[1] }, .z_index = 80, .keep_on_screen = true }
+    else
+        .{ .attach = .id, .to = "ribbon/columns", .fractions = .{ .element_x = 0, .element_y = 0, .target_x = 0, .target_y = 1 }, .z_index = 80 };
+    menus.begin(self, kit, "menu/columns", floating);
+    defer menus.end(kit);
+    if (self.columns_col) |col| {
+        if (menus.row(self, kit, "menu/columns/fit", "Size column to fit", .{})) {
+            self.menu = .none;
+            fitColumn(self, kit, t, colOf(col));
+            return self.folder_views.remember(self.io, t);
+        }
+    }
+    if (menus.row(self, kit, "menu/columns/fit-all", "Size all columns to fit", .{ .shortcut = if (self.ten()) null else "Ctrl+Num +" })) {
+        self.menu = .none;
+        return fitAllColumns(self, kit);
+    }
+    menus.separator(self, kit);
+    inline for (@typeInfo(Folder.Column).@"enum".fields) |f| {
+        const c: Folder.Column = @enumFromInt(f.value);
+        const bit = @as(u16, 1) << f.value;
+        const on = c == .name or t.columns & bit != 0;
+        if (menus.row(self, kit, "menu/columns/" ++ f.name, colName(colOf(c)), .{ .marked = on, .ticked = true, .disabled = c == .name })) {
+            t.columns ^= bit;
+            self.menu = .none;
+            return self.folder_views.remember(self.io, t);
+        }
+    }
+    menus.separator(self, kit);
+    if (menus.row(self, kit, "menu/columns/more", "More...", .{})) {
+        self.menu = .none;
+        self.choose_details = .{ .columns = t.columns, .widths = t.widths };
+    }
+}
+
+/// "Choose Details": the columns ticked or not, and the width of the one
+/// chosen - Windows' dialog.
+pub fn chooseDetails(self: *Files, kit: *Kit) void {
+    const d = &(self.choose_details orelse return);
+    const u = kit.ui;
+    const p = &kit.theme.palette;
+    const ten = self.ten();
+    const t = self.tab();
+    u.open(.{ .id = "details/smoke", .width = .grow, .height = .grow, .align_x = .center, .align_y = .center, .background_color = p.smoke.withAlpha(0.15), .floating = .{ .attach = .root, .z_index = 95 } });
+    defer u.close();
+    u.open(.{
+        .id = "choose-details",
+        .width = .fixed(400),
+        .direction = .top_to_bottom,
+        .corner_radius = .all(if (ten) 0 else 8),
+        .background_color = if (p.mode == .dark) widgets.argb(0xFF2B2B2B) else widgets.argb(0xFFF0F0F0),
+        .border = .{ .color = if (ten) widgets.argb(0xFF1979CA) else p.surface_stroke_flyout, .width = .all(1) },
+        .shadow = kit.elevation(.window),
+        .clip = .both,
+    });
+    defer u.close();
+    {
+        u.open(.{ .width = .grow, .height = .fixed(32), .padding = .trbl(0, 0, 0, 12), .align_y = .center });
+        defer u.close();
+        u.open(.{ .width = .grow });
+        kit.label("Choose Details", .caption, p.text_primary);
+        u.close();
+    }
+    u.open(.{ .width = .grow, .direction = .top_to_bottom, .padding = .all(14), .gap = 8 });
+    {
+        defer u.close();
+        var style = kit.style(.caption, p.text_primary);
+        style.wrap = .words;
+        u.text("Select the details you want to display for the files in this folder.", style);
+        kit.label("Details:", .caption, p.text_primary);
+        u.open(.{ .width = .grow, .gap = 10 });
+        defer u.close();
+        u.open(.{ .width = .grow, .direction = .top_to_bottom, .padding = .all(4), .background_color = if (p.mode == .dark) widgets.argb(0xFF202020) else widgets.argb(0xFFFFFFFF), .border = .{ .color = p.divider, .width = .all(1) } });
+        inline for (@typeInfo(Folder.Column).@"enum".fields) |f| {
+            const c: Folder.Column = @enumFromInt(f.value);
+            const bit = @as(u16, 1) << f.value;
+            const id = "choose-details/" ++ f.name;
+            const lit = d.chosen == f.value;
+            u.open(.{ .id = id, .width = .grow, .height = .fixed(20), .gap = 6, .padding = .xy(4, 0), .align_y = .center, .background_color = if (lit) p.accent.withAlpha(0.25) else if (u.isPointerOver(id)) p.subtle_secondary else .transparent });
+            var on = c == .name or d.columns & bit != 0;
+            u.open(.{ .width = .fixed(13), .height = .fixed(13), .align_x = .center, .align_y = .center, .background_color = if (on) p.accent else p.solid_base, .border = if (on) .{} else .{ .color = p.text_secondary, .width = .all(1) } });
+            if (on) kit.icon(.checkmark, 10, p.text_on_accent, .regular);
+            u.close();
+            kit.label(colName(colOf(c)), .caption, p.text_primary);
+            if (u.justReleased()) {
+                d.chosen = f.value;
+                // A click on the box ticks it; Name stays.
+                const px = if (self.window.pointer_at) |ptr| ptr[0] else 0;
+                if (c != .name and px < (if (self.window.boxOf(id)) |b| b.x + 24 else 0)) {
+                    on = !on;
+                    d.columns ^= bit;
+                }
+            }
+            u.close();
+        }
+        u.close();
+        u.open(.{ .direction = .top_to_bottom, .gap = 6 });
+        defer u.close();
+        const chosen_col: Folder.Column = @enumFromInt(d.chosen);
+        const bit = @as(u16, 1) << @intCast(d.chosen);
+        const shown = chosen_col == .name or d.columns & bit != 0;
+        if (kit.button("choose-details/show", "Show", .{ .width = .fixed(90), .disabled = shown })) d.columns |= bit;
+        if (kit.button("choose-details/hide", "Hide", .{ .width = .fixed(90), .disabled = !shown or chosen_col == .name })) d.columns &= ~bit;
+    }
+    {
+        u.open(.{ .width = .grow, .padding = .trbl(0, 14, 0, 14), .gap = 8, .align_y = .center });
+        defer u.close();
+        const chosen_col: Folder.Column = @enumFromInt(d.chosen);
+        const w = d.widths[d.chosen];
+        kit.label(kit.print("Width of selected column (in pixels): {d}", .{if (w > 0) w else @as(u16, @intFromFloat(colWidth(colOf(chosen_col)) orelse 240))}), .caption, p.text_primary);
+        if (kit.button("choose-details/narrower", "", .{ .icon = .subtract })) d.widths[d.chosen] = @max(40, (if (w > 0) w else @as(u16, @intFromFloat(colWidth(colOf(chosen_col)) orelse 240))) -| 10);
+        if (kit.button("choose-details/wider", "", .{ .icon = .add })) d.widths[d.chosen] = (if (w > 0) w else @as(u16, @intFromFloat(colWidth(colOf(chosen_col)) orelse 240))) + 10;
+    }
+    u.open(.{ .width = .grow, .padding = .all(12), .gap = 8, .align_x = .right });
+    defer u.close();
+    if (kit.button("choose-details/ok", "OK", .{ .width = .fixed(80) })) {
+        t.columns = d.columns;
+        t.widths = d.widths;
+        self.folder_views.remember(self.io, t);
+        self.choose_details = null;
+        return;
+    }
+    if (kit.button("choose-details/cancel", "Cancel", .{ .width = .fixed(80) })) self.choose_details = null;
 }
 
 fn detailsRow(self: *Files, kit: *Kit, i: usize, row_h: f32) void {
@@ -707,9 +972,10 @@ fn detailsRow(self: *Files, kit: *Kit, i: usize, row_h: f32) void {
     const ink = if (e.hidden) p.text_secondary else p.text_primary;
     var secondary = kit.style(.caption, p.text_secondary);
     secondary.wrap = .none;
-    for (columnsOf(t)) |c| {
+    var columns_buffer: [12]Col = undefined;
+    for (columnsOf(t, &columns_buffer)) |c| {
         if (c == .name) {
-            u.open(.{ .width = colSizing(c), .height = .grow, .padding = .xy(if (ten) 6 else 8, 0), .gap = 8, .align_y = .center, .clip = .both });
+            u.open(.{ .width = colSizing(t, c), .height = .grow, .padding = .xy(if (ten) 6 else 8, 0), .gap = 8, .align_y = .center, .clip = .both });
             defer u.close();
             u.open(.{ .width = .fixed(16), .height = .fixed(16), .opacity = if (e.hidden) 0.55 else 1 });
             icons.forEntry(self, kit, t.dirOf(e) orelse "/", e, 16);
@@ -719,7 +985,7 @@ fn detailsRow(self: *Files, kit: *Kit, i: usize, row_h: f32) void {
             nameOrField(self, kit, i, e, style);
             continue;
         }
-        u.open(.{ .width = colSizing(c), .padding = .xy(8, 0), .align_x = if (c == .size) .right else .left, .clip = .both });
+        u.open(.{ .width = colSizing(t, c), .padding = .xy(8, 0), .align_x = if (c == .size) .right else .left, .clip = .both });
         defer u.close();
         var buffer: [256]u8 = undefined;
         u.text(kit.print("{s}", .{cellText(self, e, c, &buffer)}), secondary);
@@ -734,6 +1000,10 @@ fn cellText(self: *Files, e: *const Folder.Entry, c: Col, buffer: []u8) []const 
         .deleted => dateText(e.deleted, buffer),
         .type => self.mime.describe(e.mime, e.name, buffer),
         .size => if (e.isFolder()) "" else detailsSize(e.size, buffer),
+        .created => dateText(e.created, buffer),
+        .accessed => dateText(e.accessed, buffer),
+        .attributes => e.attributes(buffer),
+        .owner => @import("Ops.zig").userName(e.uid, buffer),
         .folder, .original => e.dir orelse "",
     };
 }

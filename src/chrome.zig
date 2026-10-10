@@ -16,6 +16,7 @@ const Tab = @import("Tab.zig");
 const Folder = @import("Folder.zig");
 const actions = @import("actions.zig");
 const win10 = @import("win10.zig");
+const views = @import("views.zig");
 const win11 = @import("win11.zig");
 const menus_mod = @import("menus.zig");
 const icons = @import("icons.zig");
@@ -532,6 +533,7 @@ pub fn menus(self: *Files, kit: *Kit) void {
         .tab => win11.tabMenu(self, kit),
         .crumb => crumbMenu(self, kit),
         .qat => win10.qatMenu(self, kit),
+        .columns => views.columnsMenu(self, kit),
     }
 }
 
@@ -595,15 +597,10 @@ fn sortMenu(self: *Files, kit: *Kit) void {
     menus_mod.begin(self, kit, "menu/sort", under(self, kit, "cmd/sort", "ribbon/sort"));
     defer menus_mod.end(kit);
     const t = self.tab();
-    const items = [_]struct { by: Folder.Column, name: []const u8 }{
-        .{ .by = .name, .name = "Name" },
-        .{ .by = .modified, .name = "Date modified" },
-        .{ .by = .type, .name = "Type" },
-        .{ .by = .size, .name = "Size" },
-    };
-    for (items) |item| {
-        if (menus_mod.row(self, kit, kit.print("menu/sort/{t}", .{item.by}), item.name, .{ .marked = t.sort_by == item.by })) {
-            if (t.sort_by != item.by) self.sortBy(item.by);
+    var list: [Folder.column_count]Folder.Column = undefined;
+    for (menus_mod.sortable(t, &list)) |by| {
+        if (menus_mod.row(self, kit, kit.print("menu/sort/{t}", .{by}), views.colName(views.colOfColumn(by)), .{ .marked = t.sort_by == by })) {
+            if (t.sort_by != by) self.sortBy(by);
             return close(self);
         }
     }
@@ -628,20 +625,17 @@ fn groupMenu(self: *Files, kit: *Kit) void {
     menus_mod.begin(self, kit, "menu/group", under(self, kit, "cmd/sort", "ribbon/group"));
     defer menus_mod.end(kit);
     const t = self.tab();
-    const items = [_]struct { by: ?Folder.Column, name: []const u8 }{
-        .{ .by = .name, .name = "Name" },
-        .{ .by = .modified, .name = "Date modified" },
-        .{ .by = .type, .name = "Type" },
-        .{ .by = .size, .name = "Size" },
-        .{ .by = null, .name = "(None)" },
-    };
-    for (items, 0..) |item, k| {
-        const on = if (item.by) |b| t.group_by == b else t.group_by == null;
-        if (k == items.len - 1) menus_mod.separator(self, kit);
-        if (menus_mod.row(self, kit, kit.print("menu/group/{d}", .{k}), item.name, .{ .marked = on })) {
-            self.groupBy(item.by);
+    var list: [Folder.column_count]Folder.Column = undefined;
+    for (menus_mod.sortable(t, &list)) |by| {
+        if (menus_mod.row(self, kit, kit.print("menu/group/{t}", .{by}), views.colName(views.colOfColumn(by)), .{ .marked = t.group_by == by })) {
+            self.groupBy(by);
             return close(self);
         }
+    }
+    menus_mod.separator(self, kit);
+    if (menus_mod.row(self, kit, "menu/group/none", "(None)", .{ .marked = t.group_by == null })) {
+        self.groupBy(null);
+        return close(self);
     }
 }
 

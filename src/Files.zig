@@ -212,6 +212,16 @@ chooser: ?chooser_mod.Chooser = null,
 /// Folder Options, open; and its drop-down open.
 options: ?options_mod.Options = null,
 options_dropdown: bool = false,
+/// A column head's edge being dragged: which column, from where, from how
+/// wide. The heads' menu: where it was asked for - null under Windows
+/// 10's Add columns - and on which column. "Choose Details", open.
+col_drag: ?struct { col: usize, from_x: f32, from_width: f32 } = null,
+/// Ctrl+Numpad + pressed: the columns sized to fit at the next drawing,
+/// which has the measurer.
+fit_columns: bool = false,
+columns_at: ?[2]f32 = null,
+columns_col: ?Folder.Column = null,
+choose_details: ?struct { columns: u16, widths: [Folder.column_count]u16, chosen: usize = 0 } = null,
 /// The item the pointer rests on, and since when: chosen by it in
 /// single-click mode, its pop-up description shown after a moment; and
 /// that description, made once for it.
@@ -234,7 +244,7 @@ show_after_len: usize = 0,
 decide_source: std.ArrayList(bool) = .empty,
 decide_dest: std.ArrayList(bool) = .empty,
 
-pub const Menu = enum { none, view, sort, group, more, new, file, move_to, copy_to, recent, tab, crumb, qat };
+pub const Menu = enum { none, view, sort, group, more, new, file, move_to, copy_to, recent, tab, crumb, qat, columns };
 pub const Confirm = enum { delete_permanently, empty_trash };
 pub const Pane = enum { none, details, preview };
 /// Which of Home's lists a thing is on.
@@ -951,6 +961,7 @@ fn draw(context: *anyopaque, window: *Window, kit: *Kit) void {
     archives.wizard(self, kit);
     chooser_mod.draw(self, kit);
     options_mod.draw(self, kit);
+    views.chooseDetails(self, kit);
     property_sheet.draw(self, kit);
     drag.tip(self, kit);
     // A right or middle click on nothing that took it.
@@ -1019,6 +1030,10 @@ fn key(context: *anyopaque, window: *Window, sym: xkb.Keysym) bool {
     }
     if (self.options != null) {
         if (code == K.Escape) self.options = null;
+        return code == K.Escape;
+    }
+    if (self.choose_details != null) {
+        if (code == K.Escape) self.choose_details = null;
         return code == K.Escape;
     }
     if (self.confirm != null) {
@@ -1148,6 +1163,12 @@ fn key(context: *anyopaque, window: *Window, sym: xkb.Keysym) bool {
         },
         K.z, K.Z => {
             actions.undo(self);
+            return true;
+        },
+        // Ctrl+Numpad +: Details' columns sized to fit.
+        K.KP_Add => {
+            if (t.view == .details) self.fit_columns = true;
+            self.window.redraw();
             return true;
         },
         K.y, K.Y => {

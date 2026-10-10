@@ -692,8 +692,13 @@ fn viewTab(self: *Files, kit: *Kit) void {
         smallColumnBegin(kit);
         defer smallColumnEnd(kit);
         if (small(kit, "ribbon/group", .apps_list, null, "Group by", true, t.lists())) self.menu = .group;
-        _ = small(kit, "ribbon/columns", .text_bullet_list, null, "Add columns", true, false);
-        _ = small(kit, "ribbon/fit", .arrow_sync, null, "Size all columns to fit", false, false);
+        const details = t.view == .details and t.lists();
+        if (small(kit, "ribbon/columns", .text_bullet_list, null, "Add columns", true, details)) {
+            self.columns_at = null;
+            self.columns_col = null;
+            self.menu = if (self.menu == .columns) .none else .columns;
+        }
+        if (small(kit, "ribbon/fit", .arrow_sync, null, "Size all columns to fit", false, details)) @import("views.zig").fitAllColumns(self, kit);
     }
     {
         groupBegin(kit);
