@@ -531,6 +531,7 @@ pub fn menus(self: *Files, kit: *Kit) void {
         .recent => recentMenu(self, kit),
         .tab => win11.tabMenu(self, kit),
         .crumb => crumbMenu(self, kit),
+        .qat => win10.qatMenu(self, kit),
     }
 }
 

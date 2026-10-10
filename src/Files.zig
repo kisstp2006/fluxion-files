@@ -49,6 +49,9 @@ const drag = @import("drag.zig");
 const Prefs = @import("Prefs.zig");
 const Preview = @import("Preview.zig");
 const Player = @import("Player.zig");
+const Jobs = @import("Jobs.zig");
+const Undo = @import("Undo.zig");
+const progress = @import("progress.zig");
 
 const Files = @This();
 
@@ -183,8 +186,22 @@ player: Player = undefined,
 pane_drag: ?struct { from_x: f32, from_width: f32 } = null,
 /// The media bar being dragged: where to, when it is let go.
 seek_value: ?f32 = null,
+/// What is being done to files, each on a thread; and what can be undone.
+jobs: Jobs = undefined,
+undo: Undo = undefined,
+/// The progress dialog: where it was moved to, the pointer's hold on its
+/// title, its details shown, folded into the status bar.
+progress_at: ?[2]f32 = null,
+progress_drag: ?[2]f32 = null,
+progress_more: bool = false,
+progress_folded: bool = false,
+/// "Let me decide for each file": for which job, and which side of each
+/// name taken is kept.
+deciding: ?u32 = null,
+decide_source: std.ArrayList(bool) = .empty,
+decide_dest: std.ArrayList(bool) = .empty,
 
-pub const Menu = enum { none, view, sort, group, more, new, file, move_to, copy_to, recent, tab, crumb };
+pub const Menu = enum { none, view, sort, group, more, new, file, move_to, copy_to, recent, tab, crumb, qat };
 pub const Confirm = enum { delete_permanently, empty_trash };
 pub const Pane = enum { none, details, preview };
 pub const RibbonTab = enum { home, share, view, manage, search };
@@ -244,6 +261,9 @@ pub fn init(self: *Files, gpa: std.mem.Allocator, io: std.Io, start: ?[]const u8
     }
     self.preview = .init(gpa, io, self.work_wake[1]);
     self.player = .init(gpa, io, self.work_wake[1]);
+    self.jobs = .init(gpa, io, self.work_wake[1]);
+    self.undo = .init(gpa);
+    self.progress_more = prefs.transfer_details;
     // Folder Options' "Open File Explorer to".
     const first: Tab.Location = if (start) |p| startPlace(p) else if (prefs.open_to == .this_pc) .this_pc else .home;
     self.newTab(first);
@@ -270,6 +290,10 @@ pub fn deinit(self: *Files) void {
     for (self.gallery_wake) |fd| if (fd >= 0) {
         _ = std.c.close(fd);
     };
+    self.jobs.deinit();
+    self.undo.deinit();
+    self.decide_source.deinit(self.gpa);
+    self.decide_dest.deinit(self.gpa);
     self.player.deinit();
     self.preview.deinit();
     for (self.work_wake) |fd| if (fd >= 0) {
@@ -549,6 +573,9 @@ fn workReady(context: *anyopaque) void {
     while (std.c.read(self.work_wake[0], &drain, drain.len) > 0) {}
     var any = self.preview.take(&self.window.icons);
     if (self.player.take(&self.window.icons)) any = true;
+    if (actions.jobsDone(self)) any = true;
+    // A job going on: the dialog drawn again.
+    if (self.jobs.running()) any = true;
     if (any) self.window.redraw();
 }
 
@@ -559,6 +586,7 @@ pub fn savePrefs(self: *Files) void {
     self.prefs.extensions = self.show_extensions;
     self.prefs.check_boxes = self.check_boxes;
     self.prefs.navigation = self.show_nav;
+    self.prefs.transfer_details = self.progress_more;
     self.prefs.pane = switch (self.pane) {
         .none => .none,
         .details => .details,
@@ -846,6 +874,7 @@ fn draw(context: *anyopaque, window: *Window, kit: *Kit) void {
     chrome.menus(self, kit);
     menus.context(self, kit);
     menus.confirmDialog(self, kit);
+    progress.draw(self, kit);
     property_sheet.draw(self, kit);
     drag.tip(self, kit);
     // A right or middle click on nothing that took it.
@@ -1026,6 +1055,14 @@ fn key(context: *anyopaque, window: *Window, sym: xkb.Keysym) bool {
         },
         K.r, K.R => {
             self.refresh();
+            return true;
+        },
+        K.z, K.Z => {
+            actions.undo(self);
+            return true;
+        },
+        K.y, K.Y => {
+            actions.redo(self);
             return true;
         },
         K.n, K.N => {

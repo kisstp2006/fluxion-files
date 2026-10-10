@@ -104,18 +104,28 @@ pub fn rename(io: std.Io, dir: []const u8, old: []const u8, new: []const u8) !vo
 
 /// Into the Recycle Bin: the home's, or - on another drive - that drive's.
 pub fn trash(io: std.Io, path: []const u8) !void {
+    var bin_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var stored_buffer: [512]u8 = undefined;
+    _ = try trashKeeping(io, path, &bin_buffer, &stored_buffer);
+}
+
+/// Where a thing put in the Recycle Bin went: which bin, its name there -
+/// what Undo takes it back out by.
+pub const Kept = struct { bin: []const u8, stored: []const u8 };
+
+pub fn trashKeeping(io: std.Io, path: []const u8, bin_buffer: []u8, stored_buffer: []u8) !Kept {
     var home_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const home_trash = homeTrash(&home_buffer) orelse return error.NoTrash;
-    trashInto(io, path, home_trash) catch |err| switch (err) {
+    const stored = trashInto(io, path, home_trash, stored_buffer) catch |err| switch (err) {
         error.CrossDevice => {
             var top_buffer: [std.fs.max_path_bytes]u8 = undefined;
             const top = mountTop(path, &top_buffer) orelse return err;
-            var trash_buffer: [std.fs.max_path_bytes]u8 = undefined;
-            const drive_trash = std.fmt.bufPrint(&trash_buffer, "{s}/.Trash-{d}", .{ if (std.mem.eql(u8, top, "/")) "" else top, linux.getuid() }) catch return err;
-            return trashInto(io, path, drive_trash);
+            const drive_trash = std.fmt.bufPrint(bin_buffer, "{s}/.Trash-{d}", .{ if (std.mem.eql(u8, top, "/")) "" else top, linux.getuid() }) catch return err;
+            return .{ .bin = drive_trash, .stored = try trashInto(io, path, drive_trash, stored_buffer) };
         },
         else => return err,
     };
+    return .{ .bin = std.fmt.bufPrint(bin_buffer, "{s}", .{home_trash}) catch return error.NameTooLong, .stored = stored };
 }
 
 pub fn homeTrash(buffer: []u8) ?[]const u8 {
@@ -126,7 +136,7 @@ pub fn homeTrash(buffer: []u8) ?[]const u8 {
 
 /// The info written first, claiming the name; then the file moved in -
 /// and, that failing, the info taken back.
-fn trashInto(io: std.Io, path: []const u8, trash_dir: []const u8) !void {
+fn trashInto(io: std.Io, path: []const u8, trash_dir: []const u8, stored_buffer: []u8) ![]const u8 {
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const files_dir = try std.fmt.bufPrint(&buffer, "{s}/files", .{trash_dir});
     try std.Io.Dir.cwd().createDirPath(io, files_dir);
@@ -168,6 +178,7 @@ fn trashInto(io: std.Io, path: []const u8, trash_dir: []const u8) !void {
         std.Io.Dir.cwd().deleteFile(io, info_path) catch {};
         return err;
     };
+    return std.fmt.bufPrint(stored_buffer, "{s}", .{name}) catch error.NameTooLong;
 }
 
 /// A path as the trash spec has it: every byte but the unreserved ones and
@@ -552,7 +563,8 @@ test "the trash keeps where a file was" {
     var trash_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const file = try join(&file_buffer, root, "my file.txt");
     const trash_dir = try join(&trash_buffer, root, "Trash");
-    try trashInto(io, file, trash_dir);
+    var stored_buffer: [512]u8 = undefined;
+    _ = try trashInto(io, file, trash_dir, &stored_buffer);
     try tmp.dir.access(io, "Trash/files/my file.txt", .{});
     var info_buffer: [1024]u8 = undefined;
     const written = try tmp.dir.readFile(io, "Trash/info/my file.txt.trashinfo", &info_buffer);
@@ -560,6 +572,6 @@ test "the trash keeps where a file was" {
     try std.testing.expect(std.mem.indexOf(u8, written, "DeletionDate=") != null);
     // A second of the same name is numbered.
     try tmp.dir.writeFile(io, .{ .sub_path = "my file.txt", .data = "y" });
-    try trashInto(io, file, trash_dir);
+    try std.testing.expectEqualStrings("my file.2.txt", try trashInto(io, file, trash_dir, &stored_buffer));
     try tmp.dir.access(io, "Trash/files/my file.2.txt", .{});
 }

@@ -516,6 +516,15 @@ fn folderMenuFull(self: *Files, kit: *Kit) void {
         done(self);
         return actions.pasteShortcut(self);
     }
+    // What Ctrl+Z and Ctrl+Y would do, as Windows' menu says it.
+    if (self.undo.next()) |step| if (row(self, kit, "context/undo", kit.print("Undo {s}", .{step.verb()}), .{ .shortcut = "Ctrl+Z" })) {
+        done(self);
+        return actions.undo(self);
+    };
+    if (self.undo.nextRedo()) |step| if (row(self, kit, "context/redo", kit.print("Redo {s}", .{step.verb()}), .{ .shortcut = "Ctrl+Y" })) {
+        done(self);
+        return actions.redo(self);
+    };
     separator(self, kit);
     if (row(self, kit, "context/terminal", "Open in Terminal", .{ .disabled = !in_folder })) {
         done(self);

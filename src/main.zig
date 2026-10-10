@@ -59,4 +59,5 @@ test {
     _ = @import("Prefs.zig");
     _ = @import("Archive.zig");
     _ = @import("Preview.zig");
+    _ = @import("Jobs.zig");
 }

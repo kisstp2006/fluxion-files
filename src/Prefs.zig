@@ -30,14 +30,28 @@ pub const Pane = enum { none, details, preview };
 pub const Underline = enum { always, hover };
 
 /// Windows 10's Quick Access Toolbar: which of its buttons are on it.
-pub const Qat = packed struct(u8) {
+pub const Qat = struct {
     undo: bool = false,
     redo: bool = false,
     delete: bool = false,
     properties: bool = true,
     new_folder: bool = true,
     rename: bool = false,
-    _: u2 = 0,
+
+    /// As the file has it: a bit each, in this order.
+    fn bits(self: Qat) u8 {
+        var out: u8 = 0;
+        inline for (@typeInfo(Qat).@"struct".fields, 0..) |f, i| {
+            if (@field(self, f.name)) out |= 1 << i;
+        }
+        return out;
+    }
+
+    fn fromBits(value: u8) Qat {
+        var out: Qat = .{};
+        inline for (@typeInfo(Qat).@"struct".fields, 0..) |f, i| @field(out, f.name) = value & (1 << i) != 0;
+        return out;
+    }
 };
 
 // -- General --
@@ -81,6 +95,8 @@ search_system: bool = false,
 pane: Pane = .none,
 navigation: bool = true,
 preview_width: f32 = 320,
+/// The progress dialog with its graph: "More details".
+transfer_details: bool = false,
 details_width: f32 = 300,
 qat: Qat = .{},
 
@@ -130,6 +146,7 @@ const keys = [_]Key{
     .{ .section = "window", .name = "pane", .field = "pane" },
     .{ .section = "window", .name = "navigation", .field = "navigation" },
     .{ .section = "window", .name = "preview_width", .field = "preview_width" },
+    .{ .section = "window", .name = "transfer_details", .field = "transfer_details" },
     .{ .section = "window", .name = "details_width", .field = "details_width" },
     .{ .section = "window", .name = "qat", .field = "qat" },
 };
@@ -159,7 +176,7 @@ fn set(self: *Prefs, comptime field: []const u8, value: []const u8) void {
         .bool => @field(self, field) = std.mem.eql(u8, value, "true"),
         .@"enum" => @field(self, field) = std.meta.stringToEnum(T, value) orelse @field(self, field),
         .float => @field(self, field) = std.fmt.parseFloat(f32, value) catch @field(self, field),
-        .@"struct" => @field(self, field) = @bitCast(std.fmt.parseInt(u8, value, 10) catch @as(u8, @bitCast(@field(self, field)))),
+        .@"struct" => @field(self, field) = Qat.fromBits(std.fmt.parseInt(u8, value, 10) catch @field(self, field).bits()),
         else => {},
     }
 }
@@ -178,7 +195,7 @@ pub fn format(self: *const Prefs, w: *std.Io.Writer) !void {
             .bool => try w.print("{s}={s}\n", .{ k.name, if (value) "true" else "false" }),
             .@"enum" => try w.print("{s}={t}\n", .{ k.name, value }),
             .float => try w.print("{s}={d:.0}\n", .{ k.name, value }),
-            .@"struct" => try w.print("{s}={d}\n", .{ k.name, @as(u8, @bitCast(value)) }),
+            .@"struct" => try w.print("{s}={d}\n", .{ k.name, value.bits() }),
             else => {},
         }
     }

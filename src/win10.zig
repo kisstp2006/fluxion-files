@@ -29,6 +29,7 @@ const Window = @import("Window.zig");
 const actions = @import("actions.zig");
 const icons = @import("icons.zig");
 const property_sheet = @import("properties.zig");
+const menus_mod = @import("menus.zig");
 
 pub const title_h = 31;
 const caption_w = 46;
@@ -87,9 +88,16 @@ pub fn titleBar(self: *Files, kit: *Kit) void {
     // its menu.
     icons.themed(self, kit, "folder", 16);
     u.empty(.{ .width = .fixed(6) });
-    if (qatButton(kit, "qat/properties", .info, "Properties", t.current() != null or t.path() != null)) self.openProperties();
-    if (qatButton(kit, "qat/new-folder", .folder, "New folder", t.path() != null)) actions.newFolder(self);
-    _ = qatButton(kit, "qat/customize", .chevron_down, "Customize Quick Access Toolbar", true);
+    // The toolbar's buttons, as it was customised: Undo, Redo, Delete,
+    // Properties, New folder, Rename.
+    const qat = self.prefs.qat;
+    if (qat.undo and qatButtonFlip(kit, "qat/undo", .arrow_reply, if (self.undo.next()) |s| kit.print("Undo {s} (Ctrl+Z)", .{s.verb()}) else "Undo (Ctrl+Z)", self.undo.next() != null, false)) actions.undo(self);
+    if (qat.redo and qatButtonFlip(kit, "qat/redo", .arrow_reply, if (self.undo.nextRedo()) |s| kit.print("Redo {s} (Ctrl+Y)", .{s.verb()}) else "Redo (Ctrl+Y)", self.undo.nextRedo() != null, true)) actions.redo(self);
+    if (qat.delete and qatButton(kit, "qat/delete", .dismiss, "Delete", t.selectedCount() > 0)) actions.delete(self, false);
+    if (qat.properties and qatButton(kit, "qat/properties", .info, "Properties", t.current() != null or t.path() != null)) self.openProperties();
+    if (qat.new_folder and qatButton(kit, "qat/new-folder", .folder, "New folder", t.path() != null)) actions.newFolder(self);
+    if (qat.rename and qatButton(kit, "qat/rename", .rename, "Rename", t.selectedCount() == 1)) if (t.current()) |i| self.startRename(i);
+    if (qatButton(kit, "qat/customize", .chevron_down, "Customize Quick Access Toolbar", true)) self.menu = if (self.menu == .qat) .none else .qat;
     u.empty(.{ .width = .fixed(1), .height = .fixed(16), .background_color = kit.theme.palette.divider });
     u.empty(.{ .width = .fixed(8) });
     {
@@ -125,6 +133,12 @@ pub fn titleBar(self: *Files, kit: *Kit) void {
 }
 
 fn qatButton(kit: *Kit, id: []const u8, glyph: widgets.icons.Name, tip: []const u8, enabled: bool) bool {
+    return qatButtonFlip(kit, id, glyph, tip, enabled, false);
+}
+
+/// A button of the toolbar, its glyph turned round where `flip`: Redo is
+/// Undo's arrow the other way.
+fn qatButtonFlip(kit: *Kit, id: []const u8, glyph: widgets.icons.Name, tip: []const u8, enabled: bool, flip: bool) bool {
     const u = kit.ui;
     const hovered = enabled and u.isPointerOver(id);
     u.open(.{
@@ -136,7 +150,10 @@ fn qatButton(kit: *Kit, id: []const u8, glyph: widgets.icons.Name, tip: []const 
         .background_color = if (enabled and u.isElementPressed(id)) pressColor(kit) else if (hovered) hoverColor(kit) else .transparent,
         .border = if (hovered) .{ .color = hoverEdge(kit), .width = .all(1) } else .{},
     });
-    kit.icon(glyph, if (glyph == .chevron_down) 10 else 14, if (enabled) (if (glyph == .folder) widgets.argb(0xFFE8B428) else blue(kit)) else kit.theme.palette.text_disabled, if (glyph == .folder) .filled else .regular);
+    const colour = if (!enabled) kit.theme.palette.text_disabled else if (glyph == .folder) widgets.argb(0xFFE8B428) else if (glyph == .dismiss) widgets.argb(0xFFE81123) else blue(kit);
+    u.open(.{ .rotate = .{ .flip_x = flip } });
+    kit.icon(glyph, if (glyph == .chevron_down) 10 else 14, colour, if (glyph == .folder) .filled else .regular);
+    u.close();
     const clicked = enabled and u.justReleased();
     u.close();
     kit.tooltip(id, tip);
@@ -634,6 +651,45 @@ fn viewTab(self: *Files, kit: *Kit) void {
         groupBegin(kit);
         defer groupEnd(kit, "");
         _ = large(kit, "ribbon/options", .settings, null, "Options", false, false);
+    }
+}
+
+/// The toolbar's own menu: which buttons are on it, ticked; and the
+/// ribbon folded or not.
+pub fn qatMenu(self: *Files, kit: *Kit) void {
+    const u = kit.ui;
+    if (self.window.down and !u.isPointerOver("menu/qat") and !u.isPointerOver("qat/customize")) {
+        self.menu = .none;
+        return;
+    }
+    menus_mod.begin(self, kit, "menu/qat", .{ .attach = .id, .to = "qat/customize", .fractions = .{ .element_x = 0, .element_y = 0, .target_x = 0, .target_y = 1 }, .z_index = 50 });
+    defer menus_mod.end(kit);
+    {
+        u.open(.{ .width = .grow, .padding = .xy(8, 4), .background_color = if (kit.theme.palette.mode == .dark) widgets.argb(0xFF3C3C3C) else widgets.argb(0xFFDDE7F2) });
+        kit.label("Customize Quick Access Toolbar", .caption, kit.theme.palette.text_primary);
+        u.close();
+    }
+    const q = &self.prefs.qat;
+    const choices = [_]struct { name: []const u8, on: *bool }{
+        .{ .name = "Undo", .on = &q.undo },
+        .{ .name = "Redo", .on = &q.redo },
+        .{ .name = "Delete", .on = &q.delete },
+        .{ .name = "Properties", .on = &q.properties },
+        .{ .name = "New folder", .on = &q.new_folder },
+        .{ .name = "Rename", .on = &q.rename },
+    };
+    for (choices, 0..) |c, k| {
+        if (menus_mod.row(self, kit, kit.print("menu/qat/{d}", .{k}), c.name, .{ .marked = c.on.*, .ticked = true })) {
+            c.on.* = !c.on.*;
+            self.prefs.save(self.io);
+            self.menu = .none;
+            return;
+        }
+    }
+    menus_mod.separator(self, kit);
+    if (menus_mod.row(self, kit, "menu/qat/fold", "Minimize the Ribbon", .{ .marked = self.ribbon_folded, .ticked = true })) {
+        self.ribbon_folded = !self.ribbon_folded;
+        self.menu = .none;
     }
 }
 

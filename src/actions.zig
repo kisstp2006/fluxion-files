@@ -11,6 +11,8 @@ const Tab = @import("Tab.zig");
 const Ops = @import("Ops.zig");
 const Look = @import("Look.zig");
 const apps = @import("apps.zig");
+const Jobs = @import("Jobs.zig");
+const Undo = @import("Undo.zig");
 
 const log = std.log.scoped(.actions);
 
@@ -83,30 +85,55 @@ pub fn canPaste(self: *Files) bool {
     return self.clipboard.items.len > 0 and self.tab().path() != null;
 }
 
-/// What was copied or cut, here: the pasted chosen afterwards, as Windows
-/// chooses them.
+/// What was copied or cut, here - copied or moved on a thread of its own,
+/// the progress dialog showing how far; the pasted chosen once it is done,
+/// as Windows chooses them.
 pub fn paste(self: *Files) void {
     const t = self.tab();
     const dir = t.path() orelse return;
-    var names: std.ArrayList([]u8) = .empty;
-    defer {
-        for (names.items) |n| self.gpa.free(n);
-        names.deinit(self.gpa);
-    }
-    var failed: ?anyerror = null;
-    for (self.clipboard.items) |source| {
-        var buffer: [512]u8 = undefined;
-        const name = (if (self.clipboard_cut) Ops.moveInto(self.io, source, dir, &buffer) else Ops.copyInto(self.io, source, dir, &buffer)) catch |err| {
-            failed = err;
-            continue;
-        };
-        names.append(self.gpa, self.gpa.dupe(u8, name) catch continue) catch {};
-    }
+    if (self.clipboard.items.len == 0) return;
+    self.jobs.start(if (self.clipboard_cut) .move else .copy, @ptrCast(self.clipboard.items), dir, null);
     // Cut, it is pasted once: gone from where it was.
     if (self.clipboard_cut) clearClipboard(self);
-    if (failed) |err| self.notify("Some items could not be pasted", err);
+    self.window.redraw();
+}
+
+/// The jobs that have finished: what they made chosen, if it is in the
+/// folder shown; kept to be undone; what went wrong said. Whether any did.
+pub fn jobsDone(self: *Files) bool {
+    var done: std.ArrayList(*Jobs.Job) = .empty;
+    defer done.deinit(self.gpa);
+    self.jobs.takeFinished(&done);
+    if (done.items.len == 0) return false;
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(self.gpa);
+    for (done.items) |j| {
+        if (j.state == .done) switch (j.kind) {
+            .copy, .extract => self.undo.made(.copy, j.made.items),
+            .compress => self.undo.made(.new, j.made.items),
+            .move => self.undo.movedAll(j.moved.items),
+            .trash => self.undo.trashedAll(j.trashed.items),
+            .delete => {},
+        };
+        if (j.failure) |err| switch (j.kind) {
+            .copy => self.notify("Some items could not be copied", err),
+            .move => self.notify("Some items could not be moved", err),
+            .trash => self.notify("Some items could not be moved to the Recycle Bin", err),
+            .delete => self.notify("Some items could not be deleted", err),
+            .extract => self.notify("The compressed folder could not be extracted", err),
+            .compress => self.notify("The compressed folder could not be made", err),
+        };
+    }
     self.refreshAll();
+    // What was made in the folder shown: chosen.
+    if (self.tab().path()) |shown| for (done.items) |j| {
+        for (j.made.items) |m| if (std.mem.eql(u8, std.fs.path.dirname(m) orelse "/", shown)) {
+            names.append(self.gpa, std.fs.path.basename(m)) catch {};
+        };
+    };
     choose(self, names.items);
+    for (done.items) |j| self.jobs.release(j);
+    return true;
 }
 
 /// Choose the entries named `names` in the tab in front, the first focused.
@@ -160,15 +187,9 @@ pub fn deleteChosen(self: *Files, permanent: bool) void {
         paths.deinit(self.gpa);
     }
     chosenPaths(self, &paths);
-    var failed: ?anyerror = null;
-    for (paths.items) |p| {
-        (if (permanent) Ops.deletePermanently(self.io, p) else Ops.trash(self.io, p)) catch |err| {
-            log.warn("could not delete {s}: {t}", .{ p, err });
-            failed = err;
-        };
-    }
-    if (failed) |err| self.notify(if (permanent) "Some items could not be deleted" else "Some items could not be moved to the Recycle Bin", err);
-    self.refreshAll();
+    if (paths.items.len == 0) return;
+    self.jobs.start(if (permanent) .delete else .trash, @ptrCast(paths.items), "", null);
+    self.window.redraw();
 }
 
 /// A new folder here, its name being typed.
@@ -178,6 +199,7 @@ pub fn newFolder(self: *Files) void {
     self.menu = .none;
     var buffer: [256]u8 = undefined;
     const name = Ops.newFolder(self.io, dir, &buffer) catch |err| return self.notify("The folder could not be made", err);
+    madeNew(self, dir, &.{name});
     self.refresh();
     choose(self, &.{name});
     if (t.focus) |i| self.startRename(i);
@@ -189,9 +211,24 @@ pub fn newTextFile(self: *Files) void {
     self.menu = .none;
     var buffer: [256]u8 = undefined;
     const name = Ops.newTextFile(self.io, dir, &buffer) catch |err| return self.notify("The document could not be made", err);
+    madeNew(self, dir, &.{name});
     self.refresh();
     choose(self, &.{name});
     if (t.focus) |i| self.startRename(i);
+}
+
+/// Things made new in `dir` - a folder, a document, shortcuts - kept to be
+/// undone.
+fn madeNew(self: *Files, dir: []const u8, names: []const []const u8) void {
+    var paths: [64][]const u8 = undefined;
+    var buffers: [64][std.fs.max_path_bytes]u8 = undefined;
+    var n: usize = 0;
+    for (names) |name| {
+        if (n == paths.len) break;
+        paths[n] = Ops.join(&buffers[n], dir, name) catch continue;
+        n += 1;
+    }
+    self.undo.made(.new, paths[0..n]);
 }
 
 /// The name typed, given - or, unchanged or empty, left as it was.
@@ -212,6 +249,7 @@ pub fn commitRename(self: *Files) void {
         error.PathAlreadyExists => return self.notify("There is already a file with the same name in this location", err),
         else => return self.notify("The item could not be renamed", err),
     };
+    self.undo.renamed(dir, old, new);
     self.refresh();
     choose(self, &.{new});
 }
@@ -267,15 +305,9 @@ pub fn sendTo(self: *Files, to: []const u8, moving: bool) void {
         paths.deinit(self.gpa);
     }
     chosenPaths(self, &paths);
-    var failed: ?anyerror = null;
-    for (paths.items) |source| {
-        var buffer: [512]u8 = undefined;
-        _ = (if (moving) Ops.moveInto(self.io, source, to, &buffer) else Ops.copyInto(self.io, source, to, &buffer)) catch |err| {
-            failed = err;
-        };
-    }
-    if (failed) |err| self.notify(if (moving) "Some items could not be moved" else "Some items could not be copied", err);
-    self.refreshAll();
+    if (paths.items.len == 0) return;
+    self.jobs.start(if (moving) .move else .copy, @ptrCast(paths.items), to, null);
+    self.window.redraw();
 }
 
 /// A shortcut to each chosen, beside it: "report - Shortcut.pdf".
@@ -299,6 +331,7 @@ pub fn createShortcut(self: *Files) void {
             continue;
         };
         names.append(self.gpa, self.gpa.dupe(u8, name) catch continue) catch {};
+        madeNew(self, std.fs.path.dirname(target) orelse "/", &.{name});
     }
     if (failed) |err| self.notify("The shortcut could not be created", err);
     self.refreshAll();
@@ -311,9 +344,11 @@ pub fn pasteShortcut(self: *Files) void {
     var failed: ?anyerror = null;
     for (self.clipboard.items) |target| {
         var buffer: [512]u8 = undefined;
-        _ = Ops.shortcut(self.io, target, dir, &buffer) catch |err| {
+        const name = Ops.shortcut(self.io, target, dir, &buffer) catch |err| {
             failed = err;
+            continue;
         };
+        madeNew(self, dir, &.{name});
     }
     if (failed) |err| self.notify("Some shortcuts could not be created", err);
     self.refreshAll();
@@ -381,30 +416,56 @@ pub fn email(self: *Files) void {
     apps.run(self.gpa, self.io, "Email", line.items, null);
 }
 
-/// Zip: the chosen files into a compressed folder beside them, named after
-/// the first, as Windows names it - through bsdtar until libarchive is
-/// read here itself.
+/// Zip: the chosen into a compressed folder beside them, named after the
+/// first, as Windows names it - made on a thread, its progress shown.
 pub fn zip(self: *Files) void {
     const t = self.tab();
     const dir = t.path() orelse return;
     const first = t.current() orelse return;
     var name_buffer: [512]u8 = undefined;
-    const stem = std.fs.path.stem(t.entry(first).name);
+    const e = t.entry(first);
+    const stem = if (e.isFolder()) e.name else std.fs.path.stem(e.name);
     var wanted_buffer: [512]u8 = undefined;
-    const wanted = std.fmt.bufPrint(&wanted_buffer, "{s}.zip", .{if (stem.len > 0) stem else t.entry(first).name}) catch return;
+    const wanted = std.fmt.bufPrint(&wanted_buffer, "{s}.zip", .{if (stem.len > 0) stem else e.name}) catch return;
     const name = Ops.freeName(self.io, dir, wanted, false, false, &name_buffer);
-    var line: std.ArrayList(u8) = .empty;
-    defer line.deinit(self.gpa);
-    line.appendSlice(self.gpa, "cd ") catch return;
-    quote(self, &line, dir);
-    line.appendSlice(self.gpa, " && bsdtar -a -cf ") catch return;
-    quote(self, &line, name);
-    for (t.selected.items, 0..) |s, i| {
-        if (!s) continue;
-        line.append(self.gpa, ' ') catch return;
-        quote(self, &line, t.entry(i).name);
+    var zip_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const zip_path = Ops.join(&zip_buffer, dir, name) catch return;
+    var paths: std.ArrayList([]u8) = .empty;
+    defer {
+        for (paths.items) |p| self.gpa.free(p);
+        paths.deinit(self.gpa);
     }
-    apps.run(self.gpa, self.io, "Zip", line.items, null);
+    chosenPaths(self, &paths);
+    if (paths.items.len == 0) return;
+    self.jobs.start(.compress, @ptrCast(paths.items), zip_path, null);
+}
+
+/// Undo (Ctrl+Z): the last thing done taken back - what it leaves chosen.
+pub fn undo(self: *Files) void {
+    undoOrRedo(self, false);
+}
+
+/// Redo (Ctrl+Y): the last thing undone, done again.
+pub fn redo(self: *Files) void {
+    undoOrRedo(self, true);
+}
+
+fn undoOrRedo(self: *Files, again: bool) void {
+    self.menu = .none;
+    self.context_open = null;
+    var arena: std.heap.ArenaAllocator = .init(self.gpa);
+    defer arena.deinit();
+    var touched: std.ArrayList([]const u8) = .empty;
+    (if (again) self.undo.redo(self.io, &touched, arena.allocator()) else self.undo.undo(self.io, &touched, arena.allocator())) catch |err| {
+        self.notify(if (again) "The last action could not be redone" else "The last action could not be undone", err);
+    };
+    self.refreshAll();
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(self.gpa);
+    if (self.tab().path()) |shown| for (touched.items) |p| {
+        if (std.mem.eql(u8, std.fs.path.dirname(p) orelse "/", shown)) names.append(self.gpa, std.fs.path.basename(p)) catch {};
+    };
+    choose(self, names.items);
 }
 
 /// A terminal in the folder shown.

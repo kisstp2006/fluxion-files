@@ -25,7 +25,6 @@ const Kit = widgets.Kit;
 const Files = @import("Files.zig");
 const Window = @import("Window.zig");
 const Ops = @import("Ops.zig");
-const actions = @import("actions.zig");
 const icons = @import("icons.zig");
 
 const Dnd = Window.Dnd;
@@ -219,44 +218,16 @@ pub fn tip(self: *Files, kit: *Kit) void {
 // The drop
 // -------------------------------------------------------------------------
 
-/// Files dropped on the window, where and as it answered.
+/// Files dropped on the window, where and as it answered: moved, copied or
+/// put in the Recycle Bin on a thread, the progress dialog showing how far.
 pub fn dropped(context: *anyopaque, window: *Window, paths: []const []const u8, answer: Dnd.Answer) void {
     _ = window;
     const self: *Files = @ptrCast(@alignCast(context));
     const to = answer.path();
-    var names: std.ArrayList([]u8) = .empty;
-    defer {
-        for (names.items) |n| self.gpa.free(n);
-        names.deinit(self.gpa);
-    }
-    var failed: ?anyerror = null;
-    for (paths) |p| {
-        if (std.mem.eql(u8, to, trash_path)) {
-            Ops.trash(self.io, p) catch |err| {
-                failed = err;
-            };
-            continue;
-        }
-        // Into itself, or moved where it is: nothing.
-        if (Ops.isInside(to, p)) continue;
-        const here = std.mem.eql(u8, std.fs.path.dirname(p) orelse "/", to);
-        if (here and answer.action == .move) continue;
-        var buffer: [512]u8 = undefined;
-        const name = (if (answer.action == .move) Ops.moveInto(self.io, p, to, &buffer) else Ops.copyInto(self.io, p, to, &buffer)) catch |err| {
-            failed = err;
-            continue;
-        };
-        names.append(self.gpa, self.gpa.dupe(u8, name) catch continue) catch {};
-    }
-    if (failed) |err| self.notify(if (answer.action == .move) "Some items could not be moved" else "Some items could not be copied", err);
-    self.refreshAll();
-    // Dropped into the folder shown: what came, chosen.
-    if (self.tab().path()) |shown| if (std.mem.eql(u8, shown, to)) {
-        var just: [256][]const u8 = undefined;
-        const n = @min(just.len, names.items.len);
-        for (names.items[0..n], 0..) |name, i| just[i] = name;
-        actions.choose(self, just[0..n]);
-    };
+    if (std.mem.eql(u8, to, trash_path)) {
+        self.jobs.start(.trash, paths, "", null);
+    } else self.jobs.start(if (answer.action == .move) .move else .copy, paths, to, null);
+    self.window.redraw();
 }
 
 test "a drop where things already are does nothing, into themselves nothing either" {
