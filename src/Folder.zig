@@ -38,6 +38,8 @@ pub const Entry = struct {
     accessed: i128 = 0,
     uid: u32 = 0,
     mode: u32 = 0,
+    /// A picture's size, where it was read: the Gallery's rows.
+    pixels: [2]u16 = .{ 0, 0 },
 
     /// Windows' Attributes column: R for read-only, H for hidden, A for
     /// archive - here a file, D a folder, L a link.
@@ -75,6 +77,12 @@ pub fn empty(gpa: std.mem.Allocator, label: []const u8) Folder {
     return self;
 }
 
+/// One entry more: a picture found at `full`, `size` pixels.
+pub fn addFoundSized(self: *Folder, io: std.Io, mime: *const Mime, full: []const u8, size: [2]u16) void {
+    self.addFound(io, mime, full);
+    if (self.entries.items.len > 0) self.entries.items[self.entries.items.len - 1].pixels = size;
+}
+
 /// One entry more: a search's finding at `full`.
 pub fn addFound(self: *Folder, io: std.Io, mime: *const Mime, full: []const u8) void {
     const a = self.arena.allocator();
@@ -90,7 +98,10 @@ pub fn addFound(self: *Folder, io: std.Io, mime: *const Mime, full: []const u8) 
         };
         entry.size = stat.size;
         entry.mtime = stat.mtime.nanoseconds;
-    } else |_| {}
+    } else |_| {
+        // Inside a compressed folder: a file, by its name.
+        entry.kind = .file;
+    }
     entry.mime = if (entry.kind == .folder) Mime.directory else mime.byName(name) orelse Mime.unknown;
     self.entries.append(a, entry) catch {};
 }

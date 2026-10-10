@@ -228,6 +228,17 @@ pub fn commandBar(self: *Files, kit: *Kit) void {
     }
     // What the chosen file is: a picture can be the wallpaper, an archive
     // taken out of.
+    // A search: Windows 11's "Search options", and closing it.
+    if (t.location == .search) {
+        divider(kit);
+        if (menuButton(kit, "cmd/search-options", .filter, "Search options", true, false)) @import("searchtools.zig").open(self, .all, "cmd/search-options");
+        if (labelButton(kit, "cmd/close-search", .dismiss, "Close search")) self.closeSearch();
+    }
+    // The Gallery: which folders its photos come from.
+    if (t.location == .gallery) {
+        divider(kit);
+        if (menuButton(kit, "cmd/collection", .image_multiple, "Collection", true, false)) self.menu = if (self.menu == .collection) .none else .collection;
+    }
     var archive_buffer: [std.fs.max_path_bytes]u8 = undefined;
     if (archives.chosenArchive(self, &archive_buffer)) |archive| {
         divider(kit);

@@ -420,14 +420,16 @@ fn driveTab(self: *Files, kit: *Kit) void {
 fn searchTab(self: *Files, kit: *Kit) void {
     const t = self.tab();
     if (t.location != .search) return;
+    const tools = @import("searchtools.zig");
+    const q = t.location.search;
     {
         groupBegin(kit);
         defer groupEnd(kit, "Location");
-        const q = t.location.search;
         const in_home = std.mem.eql(u8, q.folder, self.places.home);
         if (large(kit, "ribbon/search-here", .folder_open, widgets.argb(0xFFE8B428), "Current\nfolder", false, true)) {}
         smallColumnBegin(kit);
         defer smallColumnEnd(kit);
+        _ = small(kit, "ribbon/search-sub", .folder, widgets.argb(0xFFE8B428), "All subfolders", false, true);
         if (small(kit, "ribbon/search-home", .home, null, "Search again in your home folder", false, !in_home)) {
             var buffer: [256]u8 = undefined;
             const query = std.fmt.bufPrint(&buffer, "{s}", .{q.query}) catch return;
@@ -436,7 +438,22 @@ fn searchTab(self: *Files, kit: *Kit) void {
     }
     {
         groupBegin(kit);
+        defer groupEnd(kit, "Refine");
+        if (large(kit, "ribbon/search-date", .calendar_ltr, null, "Date\nmodified", true, true)) tools.open(self, .date, "ribbon/search-date");
+        smallColumnBegin(kit);
+        defer smallColumnEnd(kit);
+        if (small(kit, "ribbon/search-kind", .apps, null, "Kind", true, true)) tools.open(self, .kind, "ribbon/search-kind");
+        if (small(kit, "ribbon/search-size", .data_area, null, "Size", true, true)) tools.open(self, .size, "ribbon/search-size");
+        if (small(kit, "ribbon/search-other", .text_bullet_list, null, "Other properties", true, true)) tools.open(self, .other, "ribbon/search-other");
+    }
+    {
+        groupBegin(kit);
         defer groupEnd(kit, "Options");
+        smallColumnBegin(kit);
+        if (small(kit, "ribbon/search-recent", .clock, null, "Recent searches", true, true)) tools.open(self, .recent, "ribbon/search-recent");
+        if (small(kit, "ribbon/search-advanced", .settings, null, "Advanced options", true, true)) tools.open(self, .advanced, "ribbon/search-advanced");
+        _ = small(kit, "ribbon/search-save", .save, null, "Save search", false, false);
+        smallColumnEnd(kit);
         if (large(kit, "ribbon/file-location", .folder_open, null, "Open file\nlocation", false, t.selectedCount() == 1)) self.openFileLocation();
         if (large(kit, "ribbon/close-search", .dismiss, widgets.argb(0xFFE81123), "Close\nsearch", false, true)) self.closeSearch();
     }

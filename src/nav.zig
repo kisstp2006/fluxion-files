@@ -173,6 +173,8 @@ pub fn pane(self: *Files, kit: *Kit) void {
         _ = row(self, kit, "nav/network", 0, .{ .glyph = .globe }, "Network", false, if (chevrons) false else null, false);
     } else {
         if (row(self, kit, "nav/home", 0, .{ .glyph = .home }, "Home", here == .home, null, false) == .go) going.to = .home;
+        // Windows 11's Gallery, under Home.
+        if (row(self, kit, "nav/gallery", 0, .{ .glyph = .image_multiple }, "Gallery", here == .gallery, null, false) == .go) going.to = .gallery;
         if (self.prefs.show_all_folders) folderRow(self, kit, &going, "nav/home-folder", 0, self.places.home, std.fs.path.basename(self.places.home), "user-home", false, chevrons);
         separator(kit);
         pinnedFolders(self, kit, &going, 0, chevrons);

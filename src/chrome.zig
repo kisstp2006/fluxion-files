@@ -249,6 +249,7 @@ fn address(self: *Files, kit: *Kit) void {
         else => kit.icon(switch (t.location) {
             .home => if (ten) .star else .home,
             .this_pc => .desktop,
+            .gallery => .image_multiple,
             else => .search,
         }, 16, if (ten and t.location == .home) widgets.argb(0xFF2B88D8) else p.text_secondary, if (ten and t.location == .home) .filled else .regular),
     }
@@ -262,6 +263,9 @@ fn address(self: *Files, kit: *Kit) void {
         },
         .trash => {
             if (crumb(self, kit, "crumb/trash", "Recycle Bin")) to = .trash;
+        },
+        .gallery => {
+            if (crumb(self, kit, "crumb/gallery", "Gallery")) to = .gallery;
         },
         .search => |q| {
             var style = kit.style(.caption, p.text_primary);
@@ -534,6 +538,8 @@ pub fn menus(self: *Files, kit: *Kit) void {
         .crumb => crumbMenu(self, kit),
         .qat => win10.qatMenu(self, kit),
         .columns => views.columnsMenu(self, kit),
+        .collection => collectionMenu(self, kit),
+        .search_options => @import("searchtools.zig").menu(self, kit),
     }
 }
 
@@ -701,6 +707,47 @@ fn newMenu(self: *Files, kit: *Kit) void {
         close(self);
         return actions.newTextFile(self);
     }
+}
+
+/// Windows 11's Gallery's Collection: the folders its photos come from,
+/// ticked - a click takes one out - and the person's others to add.
+fn collectionMenu(self: *Files, kit: *Kit) void {
+    if (closeOnPressOutside(self, kit, "menu/collection", &.{"cmd/collection"})) return;
+    menus_mod.begin(self, kit, "menu/collection", under(self, kit, "cmd/collection", "cmd/collection"));
+    defer menus_mod.end(kit);
+    var roots_buffer: [16][]const u8 = undefined;
+    const roots = self.history.galleryFolders(self.io, self.places.pathOf(.pictures), &roots_buffer);
+    var kept: [16][]const u8 = undefined;
+    var n: usize = 0;
+    var changed = false;
+    for (roots, 0..) |r, k| {
+        if (menus_mod.row(self, kit, kit.print("menu/collection/in/{d}", .{k}), std.fs.path.basename(r), .{ .themed = "folder-pictures", .marked = true, .ticked = true, .disabled = roots.len == 1 })) {
+            changed = true;
+            continue;
+        }
+        kept[n] = r;
+        n += 1;
+    }
+    menus_mod.separator(self, kit);
+    for (self.places.user.items, 0..) |f, k| {
+        const in = for (roots) |r| {
+            if (std.mem.eql(u8, r, f.path)) break true;
+        } else false;
+        if (in or n == kept.len) continue;
+        if (menus_mod.row(self, kit, kit.print("menu/collection/add/{d}", .{k}), kit.print("Add {s}", .{f.name}), .{ .themed = @import("icons.zig").special(f.special) })) {
+            kept[n] = f.path;
+            n += 1;
+            changed = true;
+        }
+    }
+    if (!changed) return;
+    // Copied out: the history's lists are read again as they are written.
+    var arena: std.heap.ArenaAllocator = .init(self.gpa);
+    defer arena.deinit();
+    for (kept[0..n]) |*k| k.* = arena.allocator().dupe(u8, k.*) catch "";
+    self.history.setGallery(self.io, kept[0..n]);
+    close(self);
+    self.scanGallery();
 }
 
 /// Windows 10's Move to and Copy to: the person's folders, at once, as

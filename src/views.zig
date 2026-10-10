@@ -57,6 +57,7 @@ pub fn content(self: *Files, kit: *Kit) void {
         .home => homePage(self, kit),
         .this_pc => thisPcPage(self, kit),
         .folder, .search, .trash => listView(self, kit),
+        .gallery => galleryView(self, kit),
     }
 }
 
@@ -157,6 +158,22 @@ fn nameOrField(self: *Files, kit: *Kit, i: usize, e: *const Folder.Entry, style:
                 return;
             }
         }
+        // A search's findings: what was searched for lit in each name, as
+        // Windows marks it.
+        if (self.tab().location == .search) if (matchIn(self.tab().location.search.query, shownName(self, e))) |m| {
+            const name = shownName(self, e);
+            const dark = kit.theme.palette.mode == .dark;
+            u.open(.{ .align_y = .center });
+            defer u.close();
+            if (m[0] > 0) u.text(name[0..m[0]], style);
+            var lit = style;
+            if (dark) lit.color = widgets.argb(0xFFFFFFFF);
+            u.open(.{ .background_color = if (dark) widgets.argb(0xFF6B5B00) else widgets.argb(0xFFFFE97F) });
+            u.text(name[m[0]..m[1]], lit);
+            u.close();
+            if (m[1] < name.len) u.text(name[m[1]..], style);
+            return;
+        };
         u.text(shownName(self, e), style);
         return;
     }
@@ -180,6 +197,19 @@ fn nameOrField(self: *Files, kit: *Kit, i: usize, e: *const Folder.Entry, style:
         // Clicked away: the name typed is given, as Windows gives it.
         actions.commitRename(self);
     }
+}
+
+/// Where the first of a search's words is in `name`, case aside.
+fn matchIn(query: []const u8, name: []const u8) ?[2]usize {
+    const q = @import("Search.zig").Query.parse(query);
+    for (q.wordList()) |w| {
+        if (w.len == 0 or w.len > name.len) continue;
+        var i: usize = 0;
+        while (i + w.len <= name.len) : (i += 1) {
+            if (std.ascii.eqlIgnoreCase(name[i .. i + w.len], w)) return .{ i, i + w.len };
+        }
+    }
+    return null;
 }
 
 /// A click, a Ctrl or Shift click, a double click, on item `i`.
@@ -1247,6 +1277,279 @@ fn tileCell(self: *Files, kit: *Kit, i: usize, cell: [2]f32) void {
         var size_buffer: [32]u8 = undefined;
         u.text(kit.print("{s}", .{Folder.sizeText(e.size, &size_buffer)}), small);
     }
+}
+
+// -------------------------------------------------------------------------
+// Windows 11's Gallery
+// -------------------------------------------------------------------------
+
+/// A row of the Gallery: its photos, how tall, where it starts.
+const PhotoRow = struct { first: usize, end: usize, h: f32, y: f32 };
+
+const gallery_row = 180;
+const gallery_gap = 4;
+const timeline_w = 56;
+
+/// A photo's width for its height, by what its first bytes said - or as
+/// most photos are, until it is known.
+fn aspectOf(e: *const Folder.Entry) f32 {
+    if (e.pixels[0] == 0 or e.pixels[1] == 0) return 1.5;
+    return std.math.clamp(@as(f32, @floatFromInt(e.pixels[0])) / @as(f32, @floatFromInt(e.pixels[1])), 0.25, 4);
+}
+
+/// The photos in rows as wide as the room, each row as tall as its photos'
+/// shapes make it - Windows 11's Gallery's justified rows; the last row
+/// left at its own height.
+fn photoRows(t: *const Tab, width: f32, out: *std.ArrayList(PhotoRow), gpa: std.mem.Allocator) void {
+    const n = t.count();
+    var i: usize = 0;
+    var y: f32 = 0;
+    while (i < n) {
+        var sum: f32 = 0;
+        var j = i;
+        while (j < n) : (j += 1) {
+            sum += aspectOf(t.entry(j));
+            const gaps: f32 = @floatFromInt((j - i) * gallery_gap);
+            if (sum * gallery_row + gaps >= width) {
+                j += 1;
+                break;
+            }
+        }
+        const gaps: f32 = @floatFromInt((j - i -| 1) * gallery_gap);
+        const full = sum * gallery_row + gaps >= width;
+        const h = if (full) (width - gaps) / sum else gallery_row;
+        out.append(gpa, .{ .first = i, .end = j, .h = h, .y = y }) catch return;
+        y += h + gallery_gap;
+        i = j;
+    }
+}
+
+fn monthOf(ns: i128, buffer: []u8) []const u8 {
+    if (ns <= 0) return "";
+    const seconds: i64 = @intCast(@divFloor(ns, std.time.ns_per_s));
+    var tm: Tm = undefined;
+    if (localtime_r(&seconds, &tm) == null) return "";
+    const months = [_][]const u8{ "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December" };
+    return std.fmt.bufPrint(buffer, "{s} {d}", .{ months[@intCast(tm.mon)], @as(u32, @intCast(tm.year + 1900)) }) catch "";
+}
+
+fn yearOf(ns: i128) i32 {
+    if (ns <= 0) return 0;
+    const seconds: i64 = @intCast(@divFloor(ns, std.time.ns_per_s));
+    var tm: Tm = undefined;
+    if (localtime_r(&seconds, &tm) == null) return 0;
+    return tm.year + 1900;
+}
+
+fn galleryView(self: *Files, kit: *Kit) void {
+    const u = kit.ui;
+    const p = &kit.theme.palette;
+    const t = self.tab();
+    const id = "gallery/scroll";
+    const View = struct { top: f32, height: f32, width: f32 };
+    const view: View = blk: {
+        const s = self.window.scale;
+        const scroll = u.scrollOf(id) orelse break :blk .{ .top = 0, .height = @floatFromInt(self.window.height), .width = @as(f32, @floatFromInt(self.window.width)) - 300 };
+        break :blk .{
+            .top = scroll.position.y / s,
+            .height = if (scroll.viewport.height > 0) scroll.viewport.height / s else @floatFromInt(self.window.height),
+            .width = if (scroll.viewport.width > 0) scroll.viewport.width / s else @as(f32, @floatFromInt(self.window.width)) - 300,
+        };
+    };
+    var rows: std.ArrayList(PhotoRow) = .empty;
+    defer rows.deinit(self.gpa);
+    photoRows(t, @max(200, view.width - 24), &rows, self.gpa);
+    // What is in sight: its months, as the Gallery's head says them.
+    var first_seen: ?usize = null;
+    var last_seen: ?usize = null;
+    for (rows.items) |r| if (r.y + r.h >= view.top and r.y <= view.top + view.height) {
+        if (first_seen == null) first_seen = r.first;
+        last_seen = r.end - 1;
+    };
+    {
+        u.open(.{ .width = .grow, .height = .fixed(40), .padding = .trbl(10, 20, 6, 20), .align_y = .center });
+        defer u.close();
+        var style = kit.style(.body_strong, p.text_primary);
+        style.wrap = .none;
+        if (t.count() == 0) {
+            u.text(if (self.searching()) "Gathering your photos\u{2026}" else "No photos here yet", style);
+        } else if (first_seen) |f| {
+            var a: [32]u8 = undefined;
+            var b: [32]u8 = undefined;
+            const from = monthOf(t.entry(f).mtime, &a);
+            const to = monthOf(t.entry(last_seen.?).mtime, &b);
+            if (std.mem.eql(u8, from, to)) u.text(kit.print("{s}", .{from}), style) else u.text(kit.print("{s} - {s}", .{ from, to }), style);
+        }
+    }
+    u.open(.{ .width = .grow, .height = .grow });
+    defer u.close();
+    {
+        u.open(.{
+            .id = id,
+            .width = .grow,
+            .height = .grow,
+            .direction = .top_to_bottom,
+            .padding = .trbl(0, 4, 12, 20),
+            .gap = gallery_gap,
+            .clip = .{ .vertical = true, .scroll_y = true, .no_drag_scroll = true },
+        });
+        defer u.close();
+        defer if (self.context_at) |at| if (u.isPointerOver(id)) {
+            t.selectNone();
+            menus.openAt(self, at, false);
+            self.context_at = null;
+        };
+        if (u.justPressed() and !overAnItem(self, u)) {
+            if (!self.window.modifierHeld("Control")) t.selectNone();
+        }
+        var above: f32 = 0;
+        var below: f32 = 0;
+        for (rows.items) |r| {
+            const in_sight = r.y + r.h >= view.top - 400 and r.y <= view.top + view.height + 400;
+            if (!in_sight) {
+                if (r.y < view.top) above += r.h + gallery_gap else below += r.h + gallery_gap;
+                continue;
+            }
+            if (above > 0) {
+                u.empty(.{ .width = .grow, .height = .fixed(above - gallery_gap) });
+                above = 0;
+            }
+            u.open(.{ .height = .fixed(r.h), .gap = gallery_gap });
+            defer u.close();
+            for (r.first..r.end) |i| photoCell(self, kit, i, aspectOf(t.entry(i)) * r.h, r.h);
+        }
+        if (below > 0) u.empty(.{ .width = .grow, .height = .fixed(below) });
+    }
+    timeline(self, kit, t, rows.items, view.top, view.height);
+}
+
+/// A thumbnail's size, to the next of a few: a row a pixel taller or
+/// shorter asks for the picture it has.
+fn bucket(box: u32) u32 {
+    for ([_]u32{ 128, 192, 256, 384 }) |b| if (box <= b) return b;
+    return 512;
+}
+
+/// A photo of the Gallery: itself, or grey until it is made; chosen, the
+/// accent around it and a tick at its corner.
+fn photoCell(self: *Files, kit: *Kit, i: usize, w: f32, h: f32) void {
+    const u = kit.ui;
+    const p = &kit.theme.palette;
+    const t = self.tab();
+    const e = t.entry(i);
+    const id = kit.print("item/{d}", .{i});
+    const selected = t.selected.items[i];
+    const hovered = u.isPointerOver(id);
+    u.open(.{
+        .id = id,
+        .width = .fixed(@floor(w)),
+        .height = .fixed(h),
+        .align_x = .center,
+        .align_y = .center,
+        .corner_radius = .all(4),
+        .background_color = p.subtle_secondary,
+        .border = if (selected) .{ .color = p.accent, .width = .all(3) } else if (hovered) .{ .color = p.text_primary.withAlpha(0.35), .width = .all(1) } else .{},
+        .clip = .both,
+    });
+    defer u.close();
+    if (u.justPressed()) pressedOn(self, u, i);
+    requests(self, u, id, i);
+    const dir = t.dirOf(e) orelse "/";
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const full = @import("Ops.zig").join(&buffer, dir, e.name) catch return;
+    const s = self.window.scale;
+    const box: u32 = @intFromFloat(@round(@max(w, h) * s));
+    if (std.mem.startsWith(u8, e.mime, "image/")) {
+        if (self.gallery.picture(full, bucket(box))) |made| {
+            u.empty(.{ .width = .fixed(@floor(w)), .height = .fixed(h), .image = .{ .texture = made.slot }, .corner_radius = .all(4) });
+        }
+    } else {
+        // A video: its kind's icon, and a play mark over it.
+        icons.forEntry(self, kit, dir, e, 48);
+    }
+    if (selected or hovered) {
+        u.open(.{
+            .width = .fixed(20),
+            .height = .fixed(20),
+            .align_x = .center,
+            .align_y = .center,
+            .corner_radius = .all(10),
+            .background_color = if (selected) p.accent else p.solid_base.withAlpha(0.8),
+            .border = .{ .color = if (selected) p.accent else p.text_secondary, .width = .all(1) },
+            .floating = .{ .attach = .parent, .offset = .{ .x = 8, .y = 8 }, .z_index = 2 },
+            .passthrough = true,
+        });
+        if (selected) kit.icon(.checkmark, 12, p.text_on_accent, .regular);
+        u.close();
+    }
+}
+
+/// The timeline down the right, as the Gallery's: each year where its
+/// photos begin, a tick each month; the pointer on it says which month,
+/// and a click goes there.
+fn timeline(self: *Files, kit: *Kit, t: *const Tab, rows: []const PhotoRow, top: f32, view_h: f32) void {
+    const u = kit.ui;
+    const p = &kit.theme.palette;
+    if (rows.len == 0) return;
+    const total = rows[rows.len - 1].y + rows[rows.len - 1].h;
+    const id = "gallery/timeline";
+    u.open(.{ .id = id, .width = .fixed(timeline_w), .height = .grow, .padding = .xy(0, 12) });
+    defer u.close();
+    const box = self.window.boxOf(id) orelse return;
+    const usable = @max(1, box.height - 24);
+    // Where the view is: a bar along it.
+    u.empty(.{
+        .width = .fixed(3),
+        .height = .fixed(@max(12, usable * @min(1, view_h / @max(1, total)))),
+        .corner_radius = .all(2),
+        .background_color = p.accent,
+        .floating = .{ .attach = .parent, .offset = .{ .x = timeline_w - 8, .y = 12 + usable * (top / @max(1, total)) } },
+        .passthrough = true,
+    });
+    var last_year: i32 = 0;
+    var last_month: [32]u8 = undefined;
+    var last_month_len: usize = 0;
+    for (rows) |r| {
+        const e = t.entry(r.first);
+        const y = 12 + usable * (r.y / total);
+        const year = yearOf(e.mtime);
+        if (year != last_year and year != 0) {
+            last_year = year;
+            u.open(.{ .floating = .{ .attach = .parent, .offset = .{ .x = 4, .y = y - 6 } }, .passthrough = true });
+            kit.label(kit.print("{d}", .{year}), .caption, p.text_secondary);
+            u.close();
+        }
+        var buffer: [32]u8 = undefined;
+        const month = monthOf(e.mtime, &buffer);
+        if (!std.mem.eql(u8, month, last_month[0..last_month_len])) {
+            last_month_len = @min(month.len, last_month.len);
+            @memcpy(last_month[0..last_month_len], month[0..last_month_len]);
+            u.empty(.{ .width = .fixed(4), .height = .fixed(4), .corner_radius = .all(2), .background_color = p.text_tertiary, .floating = .{ .attach = .parent, .offset = .{ .x = timeline_w - 8, .y = y } }, .passthrough = true });
+        }
+    }
+    // The pointer on it: which month that is, and a click goes there.
+    if (!u.isPointerOver(id)) return;
+    const at = self.window.pointer_at orelse return;
+    const fraction = std.math.clamp((at[1] - box.y - 12) / usable, 0, 1);
+    const want = fraction * total;
+    var row = rows[0];
+    for (rows) |r| if (r.y <= want) {
+        row = r;
+    };
+    var buffer: [32]u8 = undefined;
+    const month = monthOf(t.entry(row.first).mtime, &buffer);
+    u.open(.{
+        .padding = .xy(8, 4),
+        .corner_radius = .all(4),
+        .background_color = p.flyout,
+        .border = .{ .color = p.surface_stroke_flyout, .width = .all(1) },
+        .shadow = kit.elevation(.tooltip),
+        .floating = .{ .attach = .root, .offset = .{ .x = box.x - 120, .y = at[1] - 12 }, .z_index = 60 },
+        .passthrough = true,
+    });
+    kit.label(kit.print("{s}", .{month}), .caption, p.text_primary);
+    u.close();
+    if (u.justPressed()) u.scrollTo("gallery/scroll", 0, row.y * self.window.scale);
 }
 
 // -------------------------------------------------------------------------

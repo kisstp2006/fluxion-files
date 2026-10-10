@@ -54,6 +54,12 @@ recent: []File = &.{},
 frequent: std.ArrayList(Frequent) = .empty,
 favorites: std.ArrayList([]const u8) = .empty,
 hidden: std.ArrayList([]const u8) = .empty,
+/// What was searched for lately, the newest first: Windows 10's Recent
+/// searches.
+searches: std.ArrayList([]const u8) = .empty,
+/// The Gallery's collection: the folders its photos come from. None
+/// written, the person's Pictures.
+collection: std.ArrayList([]const u8) = .empty,
 /// When the lists were read last: read again a few seconds later.
 read_ms: i64 = 0,
 
@@ -76,9 +82,13 @@ pub fn refresh(self: *History, io: std.Io) void {
     self.frequent = .empty;
     self.favorites = .empty;
     self.hidden = .empty;
+    self.searches = .empty;
+    self.collection = .empty;
     const a = self.arena.allocator();
     readLines(io, a, "fluxion/recent-hidden", &self.hidden);
     readLines(io, a, "fluxion/files-favorites", &self.favorites);
+    readLines(io, a, "fluxion/files-searches", &self.searches);
+    readLines(io, a, "fluxion/files-gallery", &self.collection);
     self.readFrequent(io);
     self.readRecent(io);
 }
@@ -289,6 +299,64 @@ pub fn setFavorite(self: *History, io: std.Io, path: []const u8, on: bool) void 
     if (on) out.print(a, "{s}\n", .{path}) catch return;
     var buffer: [512]u8 = undefined;
     write(io, statePath(&buffer, "fluxion/files-favorites") orelse return, out.items);
+    self.stale();
+}
+
+/// Searched for: first on Recent searches, once.
+pub fn searched(self: *History, io: std.Io, text: []const u8) void {
+    const trimmed = std.mem.trim(u8, text, " \t");
+    if (trimmed.len == 0 or std.mem.indexOfScalar(u8, trimmed, '\n') != null) return;
+    self.refresh(io);
+    var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var out: std.ArrayList(u8) = .empty;
+    out.print(a, "{s}\n", .{trimmed}) catch return;
+    var kept: usize = 1;
+    for (self.searches.items) |s| {
+        if (kept == 10) break;
+        if (std.mem.eql(u8, s, trimmed)) continue;
+        out.print(a, "{s}\n", .{s}) catch return;
+        kept += 1;
+    }
+    var buffer: [512]u8 = undefined;
+    write(io, statePath(&buffer, "fluxion/files-searches") orelse return, out.items);
+    self.stale();
+}
+
+/// Windows 10's "Clear search history".
+pub fn clearSearches(self: *History, io: std.Io) void {
+    var buffer: [512]u8 = undefined;
+    write(io, statePath(&buffer, "fluxion/files-searches") orelse return, "");
+    self.stale();
+}
+
+/// The Gallery's collection: the folders written, or the person's
+/// Pictures.
+pub fn galleryFolders(self: *History, io: std.Io, pictures: ?[]const u8, out: *[16][]const u8) []const []const u8 {
+    self.refresh(io);
+    var n: usize = 0;
+    for (self.collection.items) |f| {
+        if (n == out.len) break;
+        out[n] = f;
+        n += 1;
+    }
+    if (n == 0) if (pictures) |p| {
+        out[0] = p;
+        n = 1;
+    };
+    return out[0..n];
+}
+
+/// A folder into the collection, or out of it.
+pub fn setGallery(self: *History, io: std.Io, folders: []const []const u8) void {
+    var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var out: std.ArrayList(u8) = .empty;
+    for (folders) |f| out.print(a, "{s}\n", .{f}) catch return;
+    var buffer: [512]u8 = undefined;
+    write(io, statePath(&buffer, "fluxion/files-gallery") orelse return, out.items);
     self.stale();
 }
 

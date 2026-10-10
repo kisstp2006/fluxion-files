@@ -222,6 +222,9 @@ fit_columns: bool = false,
 columns_at: ?[2]f32 = null,
 columns_col: ?Folder.Column = null,
 choose_details: ?struct { columns: u16, widths: [Folder.column_count]u16, chosen: usize = 0 } = null,
+/// The search's menus: which is open, and under which button.
+search_menu: @import("searchtools.zig").Which = .all,
+search_anchor: []const u8 = "",
 /// The item the pointer rests on, and since when: chosen by it in
 /// single-click mode, its pop-up description shown after a moment; and
 /// that description, made once for it.
@@ -244,7 +247,7 @@ show_after_len: usize = 0,
 decide_source: std.ArrayList(bool) = .empty,
 decide_dest: std.ArrayList(bool) = .empty,
 
-pub const Menu = enum { none, view, sort, group, more, new, file, move_to, copy_to, recent, tab, crumb, qat, columns };
+pub const Menu = enum { none, view, sort, group, more, new, file, move_to, copy_to, recent, tab, crumb, qat, columns, collection, search_options };
 pub const Confirm = enum { delete_permanently, empty_trash };
 pub const Pane = enum { none, details, preview };
 /// Which of Home's lists a thing is on.
@@ -296,7 +299,7 @@ pub fn init(self: *Files, gpa: std.mem.Allocator, io: std.Io, start: ?[]const u8
     if (std.c.pipe2(&self.search_wake, .{ .CLOEXEC = true, .NONBLOCK = true }) == 0) {
         self.window.addWatch(.{ .fd = self.search_wake[0], .context = self, .ready = searchReady });
     }
-    self.search = .{ .gpa = gpa, .io = io, .wake = self.search_wake[1] };
+    self.search = .{ .gpa = gpa, .io = io, .wake = self.search_wake[1], .mime = &self.mime };
     if (std.c.pipe2(&self.gallery_wake, .{ .CLOEXEC = true, .NONBLOCK = true }) == 0) {
         self.window.addWatch(.{ .fd = self.gallery_wake[0], .context = self, .ready = galleryReady });
     }
@@ -569,8 +572,15 @@ pub fn searchChanged(self: *Files) void {
     }
     t.folder = Folder.empty(self.gpa, "Search");
     t.refilter(self.show_hidden);
-    self.search.start(from, query);
+    self.search.start(from, query, self.searchOptions());
+    self.history.searched(self.io, query);
     self.window.redraw();
+}
+
+/// How Folder Options says to search: in what is in the files, in
+/// compressed folders, in hidden and system ones.
+pub fn searchOptions(self: *const Files) Search.Options {
+    return .{ .contents = self.prefs.search_contents, .archives = self.prefs.search_archives, .system = self.prefs.search_system };
 }
 
 /// Search `folder` for `query`, the box saying what is searched for.
@@ -583,7 +593,7 @@ pub fn searchIn(self: *Files, folder: []const u8, query: []const u8) void {
     if (t.location == .search) t.replace(.{ .search = .{ .folder = from, .query = what } }) else t.go(.{ .search = .{ .folder = from, .query = what } });
     t.folder = Folder.empty(self.gpa, "Search");
     t.refilter(self.show_hidden);
-    self.search.start(from, what);
+    self.search.start(from, what, self.searchOptions());
     self.window.layout.setTextValue("search/field", what);
     self.window.redraw();
 }
@@ -663,15 +673,21 @@ fn searchReady(context: *anyopaque) void {
     var drain: [256]u8 = undefined;
     while (std.c.read(self.search_wake[0], &drain, drain.len) > 0) {}
     const t = self.tab();
-    if (t.location != .search) return;
-    var found: std.ArrayList([]u8) = .empty;
+    if (t.location != .search and t.location != .gallery) return;
+    var found: std.ArrayList(Search.Found) = .empty;
     defer {
-        for (found.items) |p| self.gpa.free(p);
+        for (found.items) |f| self.gpa.free(f.path);
         found.deinit(self.gpa);
     }
     self.search.take(&found);
     const folder = &(t.folder orelse return);
-    for (found.items) |full| folder.addFound(self.io, &self.mime, full);
+    for (found.items) |f| folder.addFoundSized(self.io, &self.mime, f.path, f.size);
+    // The Gallery: newest first, what is chosen kept chosen.
+    if (t.location == .gallery) {
+        t.resortKeeping(&self.mime, self.show_hidden);
+        self.window.redraw();
+        return;
+    }
     // Kept in the order searched; the list grows below what is chosen.
     const keep_selected = t.selected.items.len;
     const old: []bool = self.gpa.dupe(bool, t.selected.items) catch &.{};
@@ -689,6 +705,7 @@ pub fn locationName(self: *Files, l: Tab.Location, buffer: []u8) []const u8 {
         .home => if (self.ten()) "Quick access" else "Home",
         .this_pc => "This PC",
         .trash => "Recycle Bin",
+        .gallery => "Gallery",
         .search => |q| std.fmt.bufPrint(buffer, "Search results in {s}", .{std.fs.path.basename(q.folder)}) catch "Search",
         .folder => |p| std.fmt.bufPrint(buffer, "{s}", .{if (std.mem.eql(u8, p, "/")) "/" else std.fs.path.basename(p)}) catch "",
     };
@@ -768,6 +785,9 @@ fn arrived(self: *Files) void {
         const typed: []const u8 = self.window.layout.textValueOf("search/field") orelse "";
         if (typed.len > 0) self.window.layout.setTextValue("search/field", "");
     }
+    // The Gallery: its collection's photos, found on the search's thread,
+    // the newest first - once the search before it has stopped.
+    if (t.location == .gallery and t.folder == null) self.scanGallery();
     self.watchFolder();
     self.window.layout.scrollTo("view/scroll", 0, 0);
     var buffer: [256]u8 = undefined;
@@ -782,12 +802,26 @@ pub fn windowTitleOf(self: *Files, t: *const Tab, buffer: []u8) []const u8 {
     return self.titleOf(t, buffer);
 }
 
+/// The Gallery's photos found anew, from its collection's folders.
+pub fn scanGallery(self: *Files) void {
+    const t = self.tab();
+    if (t.location != .gallery) return;
+    if (t.folder) |*f| f.deinit();
+    t.folder = Folder.empty(self.gpa, "Gallery");
+    t.sort_by = .modified;
+    t.ascending = false;
+    t.refilter(self.show_hidden);
+    var roots: [16][]const u8 = undefined;
+    self.search.startQuery(self.history.galleryFolders(self.io, self.places.pathOf(.pictures), &roots), "", .{ .kind = .media, .measure = true });
+}
+
 /// What a tab, and the window, is called: the folder's name, as Windows'.
 pub fn titleOf(self: *Files, t: *const Tab, buffer: []u8) []const u8 {
     return switch (t.location) {
         .home => if (self.ten()) "Quick access" else "Home",
         .this_pc => "This PC",
         .trash => "Recycle Bin",
+        .gallery => "Gallery",
         .search => |q| std.fmt.bufPrint(buffer, "Search Results in {s}", .{std.fs.path.basename(q.folder)}) catch "Search Results",
         .folder => |p| blk: {
             if (std.mem.eql(u8, p, "/")) break :blk "Local Disk";

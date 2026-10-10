@@ -31,12 +31,15 @@ const actions = @import("actions.zig");
 const apps_mod = @import("apps.zig");
 const icons = @import("icons.zig");
 const archives = @import("archives.zig");
+const searchtools = @import("searchtools.zig");
 
 const menu_id = "context";
 const sub_id = "context/sub";
+/// The menu beside a row: a press on it is not a press beside the menu.
+pub const sub_menu_id = sub_id;
 
 /// The menus a row opens beside it.
-pub const Sub = enum { none, view, sort, group, new, send_to, open_with, show, compress };
+pub const Sub = enum { none, view, sort, group, new, send_to, open_with, show, compress, search_date, search_kind, search_size, search_advanced, search_recent };
 
 /// Drawing the menu beside, not the menu itself: a row under the pointer
 /// there keeps it open.
@@ -243,6 +246,11 @@ pub fn subRowMarked(self: *Files, kit: *Kit, id: []const u8, content: []const u8
         .open_with => openWithMenu(self, kit),
         .show => showMenu(self, kit),
         .compress => archives.compressMenu(self, kit),
+        .search_date => searchtools.dateMenu(self, kit),
+        .search_kind => searchtools.kindMenu(self, kit),
+        .search_size => searchtools.sizeMenu(self, kit),
+        .search_advanced => searchtools.advancedMenu(self, kit),
+        .search_recent => searchtools.recentMenu(self, kit),
     }
 }
 

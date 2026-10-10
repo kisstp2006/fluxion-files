@@ -21,6 +21,8 @@ pub const Location = union(enum) {
     folder: []const u8,
     /// What a search in a folder found.
     search: Search,
+    /// Windows 11's Gallery: the photos of its collection's folders.
+    gallery,
 
     pub const Search = struct { folder: []const u8, query: []const u8 };
 
@@ -29,6 +31,7 @@ pub const Location = union(enum) {
             .home => b == .home,
             .this_pc => b == .this_pc,
             .trash => b == .trash,
+            .gallery => b == .gallery,
             .folder => |p| b == .folder and std.mem.eql(u8, p, b.folder),
             .search => |q| b == .search and std.mem.eql(u8, q.folder, b.search.folder) and std.mem.eql(u8, q.query, b.search.query),
         };
@@ -179,9 +182,39 @@ pub fn dirOf(self: *const Tab, e: *const Folder.Entry) ?[]const u8 {
 /// Bin.
 pub fn lists(self: *const Tab) bool {
     return switch (self.location) {
-        .folder, .search, .trash => true,
+        .folder, .search, .trash, .gallery => true,
         else => false,
     };
+}
+
+/// Sorted again as it is to be - the Gallery as its photos come - what was
+/// chosen and where the keyboard was kept, by where each is.
+pub fn resortKeeping(self: *Tab, mime: *Mime, show_hidden: bool) void {
+    const f = &(self.folder orelse return);
+    var keep: std.ArrayList(*const Folder.Entry) = .empty;
+    defer keep.deinit(self.gpa);
+    // Entries move as they sort: by their name and folder, then.
+    var names: std.ArrayList([2][]const u8) = .empty;
+    defer names.deinit(self.gpa);
+    var focus_name: ?[2][]const u8 = null;
+    for (self.shown.items, 0..) |index, i| {
+        const e = &f.entries.items[index];
+        if (i < self.selected.items.len and self.selected.items[i]) names.append(self.gpa, .{ e.name, e.dir orelse "" }) catch {};
+        if (self.focus == i) focus_name = .{ e.name, e.dir orelse "" };
+    }
+    _ = &keep;
+    // The names point into the folder's arena, which sorting leaves be.
+    f.sort(self.sort_by, self.ascending, mime);
+    self.refilter(show_hidden);
+    for (self.shown.items, 0..) |index, i| {
+        const e = &f.entries.items[index];
+        for (names.items) |n| if (std.mem.eql(u8, n[0], e.name) and std.mem.eql(u8, n[1], e.dir orelse "")) {
+            self.selected.items[i] = true;
+        };
+        if (focus_name) |n| if (std.mem.eql(u8, n[0], e.name) and std.mem.eql(u8, n[1], e.dir orelse "")) {
+            self.focus = i;
+        };
+    }
 }
 
 /// Whether the folder shown is inside a compressed folder: read, not
