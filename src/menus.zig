@@ -721,16 +721,17 @@ fn openWithMenu(self: *Files, kit: *Kit) void {
     const installed = self.installedApps() orelse return;
     var found: [10]*const apps_mod.App = undefined;
     const list = self.open_with.appsFor(installed, e.mime, &found);
-    if (list.len == 0) {
-        _ = row(self, kit, "context/with/none", "No apps open this kind of file", .{ .disabled = true });
-        return;
-    }
     for (list, 0..) |app, k| {
         const image = if (app.icon.len > 0) self.window.icons.lookup(app.icon, 16) else null;
         if (row(self, kit, kit.print("context/with/{d}", .{k}), app.name, .{ .image = image, .icon = if (image == null) .apps else null })) {
             done(self);
             return actions.openWith(self, app);
         }
+    }
+    if (list.len > 0) separator(self, kit);
+    if (row(self, kit, "context/with/choose", "Choose another app", .{ .icon = if (self.ten()) null else .apps })) {
+        done(self);
+        return @import("chooser.zig").openForChosen(self);
     }
 }
 

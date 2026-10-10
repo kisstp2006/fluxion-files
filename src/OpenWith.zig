@@ -66,6 +66,25 @@ pub fn parse(self: *OpenWith, text: []const u8) void {
     }
 }
 
+/// From now on `app_id` opens `mime`: written into this desktop's own
+/// list, `fluxion-mimeapps.list` - read before the shared ones - and taken
+/// at once.
+pub fn setDefault(self: *OpenWith, io: std.Io, mime: []const u8, app_id: []const u8) !void {
+    const a = self.arena.allocator();
+    const config = if (std.c.getenv("XDG_CONFIG_HOME")) |d|
+        try a.dupe(u8, std.mem.span(d))
+    else
+        try std.fmt.allocPrint(a, "{s}/.config", .{std.mem.span(std.c.getenv("HOME") orelse return error.NoHome)});
+    const file = try std.fmt.allocPrint(a, "{s}/fluxion-mimeapps.list", .{config});
+    const was = std.Io.Dir.cwd().readFileAlloc(io, file, a, .limited(1 << 20)) catch "[Default Applications]\n";
+    var out: std.ArrayList(u8) = .empty;
+    const value = try std.fmt.allocPrint(a, "{s};", .{app_id});
+    try @import("actions.zig").setKey(a, &out, was, "Default Applications", mime, value);
+    std.Io.Dir.cwd().createDirPath(io, config) catch {};
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = out.items });
+    try self.defaults.put(a, try a.dupe(u8, mime), value);
+}
+
 /// The app that opens `mime`, if any does.
 pub fn defaultFor(self: *const OpenWith, apps: *const apps_mod.Apps, mime: []const u8) ?*const App {
     if (self.defaults.get(mime)) |list| {

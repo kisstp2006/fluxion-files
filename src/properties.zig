@@ -197,7 +197,24 @@ fn general(self: *Files, kit: *Kit, sheet: *Sheet, edge: ui.Color) void {
     line(kit, if (sheet.folder) "Type:" else "Type of file:", kit.print("{s}", .{kind}));
     if (!sheet.folder) if (self.installedApps()) |apps| {
         const app = self.open_with.defaultFor(apps, sheet.mime);
-        line(kit, "Opens with:", if (app) |a| kit.print("{s}", .{a.name}) else "No app");
+        // Its app, and Change... to choose another, as Windows has them.
+        const row_ui = kit.ui;
+        row_ui.open(.{ .width = .grow, .gap = 8, .align_y = .center });
+        defer row_ui.close();
+        row_ui.open(.{ .width = .fixed(100) });
+        kit.label("Opens with:", .caption, p.text_primary);
+        row_ui.close();
+        if (app) |a| if (self.window.icons.lookup(a.icon, 16)) |texture| row_ui.empty(.{ .width = .fixed(16), .height = .fixed(16), .image = .{ .texture = texture } });
+        row_ui.open(.{ .width = .grow, .clip = .both });
+        kit.label(if (app) |a| kit.print("{s}", .{a.name}) else "Pick an app", .caption, p.text_primary);
+        row_ui.close();
+        if (kit.button("properties/change", "Change...", .{})) {
+            var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const path = std.fmt.bufPrint(&path_buffer, "{s}", .{sheet.path()}) catch return;
+            const mime = sheet.mime;
+            self.properties = null;
+            return @import("chooser.zig").open(self, path, mime);
+        }
     };
     rule(kit, edge);
     line(kit, "Location:", kit.print("{s}", .{std.fs.path.dirname(sheet.path()) orelse "/"}));

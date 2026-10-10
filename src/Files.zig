@@ -53,6 +53,7 @@ const Jobs = @import("Jobs.zig");
 const Undo = @import("Undo.zig");
 const progress = @import("progress.zig");
 const archives = @import("archives.zig");
+const chooser_mod = @import("chooser.zig");
 const Archive = @import("Archive.zig");
 
 const Files = @This();
@@ -203,6 +204,8 @@ deciding: ?u32 = null,
 /// "Extract Compressed (Zipped) Folders", open; and the folder to show
 /// once what it takes out is out.
 wizard: ?archives.Wizard = null,
+/// "Choose another app", open.
+chooser: ?chooser_mod.Chooser = null,
 show_after_buffer: [std.fs.max_path_bytes]u8 = undefined,
 show_after_len: usize = 0,
 decide_source: std.ArrayList(bool) = .empty,
@@ -757,10 +760,8 @@ pub fn open(self: *Files, i: usize, new_tab: bool) void {
 
 pub fn openFile(self: *Files, path: []const u8, mime: []const u8) void {
     const apps = self.installedApps() orelse return;
-    const app = self.open_with.defaultFor(apps, mime) orelse {
-        log.warn("no app opens {s}", .{mime});
-        return;
-    };
+    // No app opens its kind yet: which is to, asked as Windows asks it.
+    const app = self.open_with.defaultFor(apps, mime) orelse return chooser_mod.open(self, path, mime);
     apps_mod.runWith(self.gpa, self.io, app.name, app.exec, path);
 }
 
@@ -887,6 +888,7 @@ fn draw(context: *anyopaque, window: *Window, kit: *Kit) void {
     menus.confirmDialog(self, kit);
     progress.draw(self, kit);
     archives.wizard(self, kit);
+    chooser_mod.draw(self, kit);
     property_sheet.draw(self, kit);
     drag.tip(self, kit);
     // A right or middle click on nothing that took it.
@@ -947,6 +949,10 @@ fn key(context: *anyopaque, window: *Window, sym: xkb.Keysym) bool {
     }
     if (self.wizard != null) {
         if (code == K.Escape) self.wizard = null;
+        return code == K.Escape;
+    }
+    if (self.chooser != null) {
+        if (code == K.Escape) self.chooser = null;
         return code == K.Escape;
     }
     if (self.confirm != null) {
