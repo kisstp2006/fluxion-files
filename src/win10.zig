@@ -558,7 +558,10 @@ fn viewTab(self: *Files, kit: *Kit) void {
     {
         groupBegin(kit);
         defer groupEnd(kit, "Panes");
-        if (large(kit, "ribbon/nav-pane", .navigation, null, "Navigation\npane", true, true)) self.show_nav = !self.show_nav;
+        if (large(kit, "ribbon/nav-pane", .navigation, null, "Navigation\npane", true, true)) {
+            self.show_nav = !self.show_nav;
+            self.savePrefs();
+        }
         smallColumnBegin(kit);
         defer smallColumnEnd(kit);
         if (small(kit, "ribbon/preview-pane", .eye, null, "Preview pane", false, true)) self.togglePane(.preview);
@@ -615,8 +618,14 @@ fn viewTab(self: *Files, kit: *Kit) void {
         groupBegin(kit);
         defer groupEnd(kit, "Show/hide");
         smallColumnBegin(kit);
-        if (check(kit, "ribbon/checkboxes", "Item check boxes", self.check_boxes)) self.check_boxes = !self.check_boxes;
-        if (check(kit, "ribbon/extensions", "File name extensions", self.show_extensions)) self.show_extensions = !self.show_extensions;
+        if (check(kit, "ribbon/checkboxes", "Item check boxes", self.check_boxes)) {
+            self.check_boxes = !self.check_boxes;
+            self.savePrefs();
+        }
+        if (check(kit, "ribbon/extensions", "File name extensions", self.show_extensions)) {
+            self.show_extensions = !self.show_extensions;
+            self.savePrefs();
+        }
         if (check(kit, "ribbon/hidden", "Hidden items", self.show_hidden)) self.toggleHidden();
         smallColumnEnd(kit);
         _ = large(kit, "ribbon/hide-selected", .eye_off, null, "Hide selected\nitems", false, false);

@@ -604,6 +604,7 @@ pub fn showMenu(self: *Files, kit: *Kit) void {
                 4 => self.show_extensions = !self.show_extensions,
                 else => self.toggleHidden(),
             }
+            self.savePrefs();
             return;
         }
     }

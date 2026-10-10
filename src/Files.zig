@@ -46,6 +46,9 @@ const property_sheet = @import("properties.zig");
 const Search = @import("Search.zig");
 const Thumbs = @import("Thumbs.zig");
 const drag = @import("drag.zig");
+const Prefs = @import("Prefs.zig");
+const Preview = @import("Preview.zig");
+const Player = @import("Player.zig");
 
 const Files = @This();
 
@@ -55,6 +58,8 @@ gpa: std.mem.Allocator,
 io: std.Io,
 window: Window = undefined,
 look: Look,
+/// Folder Options, and what else is kept between windows.
+prefs: Prefs,
 look_watch: ?std.c.fd_t = null,
 /// Rings a moment after a new look: this window takes it after the
 /// compositor has its picture of the screens to cross over from.
@@ -167,6 +172,17 @@ rename_pending_ms: i64 = 0,
 /// The photos of the icon views, made on a thread, and its pipe.
 gallery: Thumbs.Gallery = undefined,
 gallery_wake: [2]std.c.fd_t = .{ -1, -1 },
+/// The pipe the other threads wake the window through: the preview's, the
+/// player's, the file operations'.
+work_wake: [2]std.c.fd_t = .{ -1, -1 },
+/// What the preview pane shows, made on a thread; and a video or a song
+/// playing in it.
+preview: Preview = undefined,
+player: Player = undefined,
+/// The pane's edge being dragged: from where, from how wide.
+pane_drag: ?struct { from_x: f32, from_width: f32 } = null,
+/// The media bar being dragged: where to, when it is let go.
+seek_value: ?f32 = null,
 
 pub const Menu = enum { none, view, sort, group, more, new, file, move_to, copy_to, recent, tab, crumb };
 pub const Confirm = enum { delete_permanently, empty_trash };
@@ -175,10 +191,21 @@ pub const RibbonTab = enum { home, share, view, manage, search };
 
 pub fn init(self: *Files, gpa: std.mem.Allocator, io: std.Io, start: ?[]const u8) !void {
     const look = Look.load(io);
+    const prefs = Prefs.load(io);
     self.* = .{
         .gpa = gpa,
         .io = io,
         .look = look,
+        .prefs = prefs,
+        .show_hidden = prefs.hidden,
+        .show_extensions = prefs.extensions,
+        .check_boxes = prefs.check_boxes,
+        .show_nav = prefs.navigation,
+        .pane = switch (prefs.pane) {
+            .none => .none,
+            .details => .details,
+            .preview => .preview,
+        },
         .mime = .load(gpa, io),
         .places = .load(gpa, io),
         .open_with = .load(gpa, io),
@@ -212,7 +239,13 @@ pub fn init(self: *Files, gpa: std.mem.Allocator, io: std.Io, start: ?[]const u8
         self.window.addWatch(.{ .fd = self.gallery_wake[0], .context = self, .ready = galleryReady });
     }
     self.gallery = .init(gpa, io, self.gallery_wake[1]);
-    const first: Tab.Location = if (start) |p| startPlace(p) else .home;
+    if (std.c.pipe2(&self.work_wake, .{ .CLOEXEC = true, .NONBLOCK = true }) == 0) {
+        self.window.addWatch(.{ .fd = self.work_wake[0], .context = self, .ready = workReady });
+    }
+    self.preview = .init(gpa, io, self.work_wake[1]);
+    self.player = .init(gpa, io, self.work_wake[1]);
+    // Folder Options' "Open File Explorer to".
+    const first: Tab.Location = if (start) |p| startPlace(p) else if (prefs.open_to == .this_pc) .this_pc else .home;
     self.newTab(first);
 }
 
@@ -235,6 +268,11 @@ pub fn deinit(self: *Files) void {
     };
     self.gallery.deinit();
     for (self.gallery_wake) |fd| if (fd >= 0) {
+        _ = std.c.close(fd);
+    };
+    self.player.deinit();
+    self.preview.deinit();
+    for (self.work_wake) |fd| if (fd >= 0) {
         _ = std.c.close(fd);
     };
     self.band_base.deinit(self.gpa);
@@ -371,11 +409,13 @@ pub fn refreshAll(self: *Files) void {
 pub fn toggleHidden(self: *Files) void {
     self.show_hidden = !self.show_hidden;
     for (self.tabs.items) |each| each.refilter(self.show_hidden);
+    self.savePrefs();
     self.window.redraw();
 }
 
 pub fn togglePane(self: *Files, which: Pane) void {
     self.pane = if (self.pane == which) .none else which;
+    self.savePrefs();
     self.window.redraw();
 }
 
@@ -499,6 +539,32 @@ fn galleryReady(context: *anyopaque) void {
     var drain: [256]u8 = undefined;
     while (std.c.read(self.gallery_wake[0], &drain, drain.len) > 0) {}
     if (self.gallery.take(&self.window.icons)) self.window.redraw();
+}
+
+/// The other threads made something: a preview, a frame of a video, a
+/// step of a file operation.
+fn workReady(context: *anyopaque) void {
+    const self: *Files = @ptrCast(@alignCast(context));
+    var drain: [256]u8 = undefined;
+    while (std.c.read(self.work_wake[0], &drain, drain.len) > 0) {}
+    var any = self.preview.take(&self.window.icons);
+    if (self.player.take(&self.window.icons)) any = true;
+    if (any) self.window.redraw();
+}
+
+/// Keep what the window shows of itself - its panes, hidden items and
+/// extensions, check boxes - for the next window.
+pub fn savePrefs(self: *Files) void {
+    self.prefs.hidden = self.show_hidden;
+    self.prefs.extensions = self.show_extensions;
+    self.prefs.check_boxes = self.check_boxes;
+    self.prefs.navigation = self.show_nav;
+    self.prefs.pane = switch (self.pane) {
+        .none => .none,
+        .details => .details,
+        .preview => .preview,
+    };
+    self.prefs.save(self.io);
 }
 
 /// The search's thread found more: into the list.

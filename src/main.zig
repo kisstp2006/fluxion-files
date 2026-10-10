@@ -56,4 +56,7 @@ test {
     _ = @import("Tab.zig");
     _ = @import("Dnd.zig");
     _ = @import("drag.zig");
+    _ = @import("Prefs.zig");
+    _ = @import("Archive.zig");
+    _ = @import("Preview.zig");
 }

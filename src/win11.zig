@@ -234,9 +234,11 @@ pub fn commandBar(self: *Files, kit: *Kit) void {
     };
     if (commandButton(kit, "cmd/more", .more_horizontal, "See more", true)) self.menu = if (self.menu == .more) .none else .more;
     u.empty(.{ .width = .grow });
-    // The details pane, as Windows 11's command bar ends.
+    // The pane on the right, as Windows 11's command bar ends: Details, or
+    // - the preview pane open - Preview.
     const id = "cmd/details";
-    const on = self.pane == .details;
+    const preview = self.pane == .preview;
+    const on = self.pane != .none;
     u.open(.{
         .id = id,
         .height = .fixed(32),
@@ -246,13 +248,13 @@ pub fn commandBar(self: *Files, kit: *Kit) void {
         .corner_radius = .all(4),
         .background_color = if (on) p.subtle_tertiary else if (u.isPointerOver(id)) p.subtle_secondary else .transparent,
     });
-    kit.icon(.info, 16, p.text_primary, .regular);
+    kit.icon(if (preview) .eye else .info, 16, p.text_primary, .regular);
     var style = kit.style(.caption, p.text_primary);
     style.wrap = .none;
-    u.text("Details", style);
-    if (u.justReleased()) self.togglePane(.details);
+    u.text(if (preview) "Preview" else "Details", style);
+    if (u.justReleased()) self.togglePane(if (preview) .preview else .details);
     u.close();
-    kit.tooltip(id, "Details pane (Alt+Shift+P)");
+    kit.tooltip(id, if (preview) "Preview pane (Alt+P)" else "Details pane (Alt+Shift+P)");
 }
 
 fn divider(kit: *Kit) void {

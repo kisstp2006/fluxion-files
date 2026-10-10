@@ -86,6 +86,12 @@ wm_base: ?*xdg.WmBase = null,
 decorations: ?*zxdg.DecorationManagerV1 = null,
 seat: ?*wl.Seat = null,
 fractional_manager: ?*wp.FractionalScaleManagerV1 = null,
+cursor_shapes: ?*wp.CursorShapeManagerV1 = null,
+cursor_device: ?*wp.CursorShapeDeviceV1 = null,
+/// The pointer's shape as last told, and the serial of its coming in -
+/// which a shape is told with.
+cursor_shown: ?ui.layout.CursorShape = null,
+enter_serial: u32 = 0,
 viewporter: ?*wp.Viewporter = null,
 /// The frame round a title bar drawn here: Fluxion's own protocol.
 frames: ?*fluxion.WindowManagerV1 = null,
@@ -132,6 +138,10 @@ shown_size: [2]u32 = .{ 0, 0 },
 content: Content,
 theme: widgets.Theme,
 font_files: widgets.Fonts.Files,
+/// The emoji and monospaced faces' bytes, where the system has them: a
+/// name with an emoji in it, code in the preview pane.
+emoji_bytes: ?[]u8 = null,
+mono_bytes: ?[]u8 = null,
 fonts: widgets.Fonts = undefined,
 painter: raster.Renderer = undefined,
 /// The GPU it draws on, and its surface's swapchain there; null to draw on
@@ -218,10 +228,17 @@ pub fn init(self: *Window, gpa: std.mem.Allocator, io: std.Io, title: [:0]const 
         .layout = .init(gpa),
     };
     self.fonts = try .init(font_files.text, font_files.strong);
+    self.emoji_bytes = widgets.Fonts.readEmoji(gpa, io);
+    if (self.emoji_bytes) |bytes| self.fonts.useEmoji(bytes);
+    self.mono_bytes = widgets.Fonts.readMono(gpa, io);
+    if (self.mono_bytes) |bytes| self.fonts.useMono(bytes);
     self.painter = try .init(gpa, &self.fonts.text);
     const faces = self.fonts.faces();
     try self.painter.setFaces(&faces);
-    self.opening = gpu_mod.Opening.start(gpa, &faces, &.{});
+    // A name with an emoji in it: the emoji drawn from the emoji face.
+    const emoji_fallback = [_]u16{widgets.Fonts.Slot.emoji};
+    if (self.fonts.emoji != null) try self.painter.setFallbacks(&emoji_fallback);
+    self.opening = gpu_mod.Opening.start(gpa, &faces, if (self.fonts.emoji != null) &emoji_fallback else &.{});
     if (self.opening) |o| self.addWatch(.{ .fd = o.fd(), .context = self, .ready = gpuOpened });
     self.profile.on = std.c.getenv("FLUXION_PROFILE") != null;
     self.icons = .init(gpa, io, null);
@@ -319,6 +336,8 @@ pub fn deinit(self: *Window) void {
     if (self.frames) |m| m.destroy();
     if (self.fractional) |f| f.destroy();
     if (self.viewport) |v| v.destroy();
+    if (self.cursor_device) |d| d.destroy();
+    if (self.cursor_shapes) |m| m.destroy();
     if (self.effect) |e| e.destroy();
     if (self.background_effects) |m| m.destroy();
     self.toplevel.destroy();
@@ -328,6 +347,8 @@ pub fn deinit(self: *Window) void {
     self.icons.deinit();
     self.painter.deinit();
     self.font_files.deinit(self.gpa);
+    if (self.emoji_bytes) |b| self.gpa.free(b);
+    if (self.mono_bytes) |b| self.gpa.free(b);
     if (self.xkb_state) |s| s.unref();
     if (self.xkb_keymap) |k| k.unref();
     if (self.xkb_context) |c| c.unref();
@@ -573,6 +594,28 @@ pub fn run(self: *Window) !void {
     }
 }
 
+/// The pointer's shape, as what is under it asks: a resize arrow over a
+/// pane's edge, the caret over a field.
+fn showCursor(self: *Window) void {
+    const device = self.cursor_device orelse return;
+    if (self.pointer_at == null) return;
+    const want = self.layout.cursor();
+    if (self.cursor_shown == want) return;
+    self.cursor_shown = want;
+    device.setShape(self.enter_serial, switch (want) {
+        .arrow => .default,
+        .ibeam => .text,
+        .crosshair => .crosshair,
+        .pointing_hand => .pointer,
+        .resize_ew => .ew_resize,
+        .resize_ns => .ns_resize,
+        .resize_nwse => .nwse_resize,
+        .resize_nesw => .nesw_resize,
+        .resize_all => .all_scroll,
+        .not_allowed => .not_allowed,
+    });
+}
+
 /// Draw again at `ms`, though nothing else happens by then.
 pub fn wakeAt(self: *Window, ms: i64) void {
     if (self.wake_at_ms == 0 or ms < self.wake_at_ms) self.wake_at_ms = ms;
@@ -598,6 +641,8 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Win
                 self.wm_base.?.setListener(*Window, wmBaseListener, self);
             } else if (std.mem.eql(u8, name, std.mem.span(zxdg.DecorationManagerV1.interface.name))) {
                 self.decorations = registry.bind(global.name, zxdg.DecorationManagerV1, 1) catch return;
+            } else if (std.mem.eql(u8, name, std.mem.span(wp.CursorShapeManagerV1.interface.name))) {
+                self.cursor_shapes = registry.bind(global.name, wp.CursorShapeManagerV1, 1) catch return;
             } else if (std.mem.eql(u8, name, std.mem.span(wp.FractionalScaleManagerV1.interface.name))) {
                 self.fractional_manager = registry.bind(global.name, wp.FractionalScaleManagerV1, 1) catch return;
             } else if (std.mem.eql(u8, name, std.mem.span(wl.DataDeviceManager.interface.name))) {
@@ -786,6 +831,7 @@ fn render(self: *Window) void {
     self.pressed_since_drawn = false;
     self.profile.stop(.layout, laid_out);
     self.dnd.tell();
+    self.showCursor();
     const again = self.input_since_drawn;
     self.input_since_drawn = false;
 
@@ -907,7 +953,10 @@ fn seatListener(seat: *wl.Seat, event: wl.Seat.Event, self: *Window) void {
         .capabilities => |caps| {
             if (caps.capabilities.pointer and self.pointer == null) {
                 self.pointer = seat.getPointer() catch null;
-                if (self.pointer) |p| p.setListener(*Window, pointerListener, self);
+                if (self.pointer) |p| {
+                    p.setListener(*Window, pointerListener, self);
+                    if (self.cursor_shapes) |m| self.cursor_device = m.getPointer(p) catch null;
+                }
             }
             if (caps.capabilities.keyboard and self.keyboard == null) {
                 self.keyboard = seat.getKeyboard() catch null;
@@ -922,6 +971,9 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, self: *Window) void 
     switch (event) {
         .enter => |enter| {
             self.pointer_at = .{ @floatCast(enter.surface_x.toDouble()), @floatCast(enter.surface_y.toDouble()) };
+            // Its shape told anew: whatever it was out there, it is ours here.
+            self.enter_serial = enter.serial;
+            self.cursor_shown = null;
             self.redraw();
         },
         .leave => {

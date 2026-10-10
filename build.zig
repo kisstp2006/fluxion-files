@@ -16,6 +16,10 @@ pub fn build(b: *std.Build) void {
     // window's size whatever the size drawn.
     scanner.addSystemProtocol("staging/fractional-scale/fractional-scale-v1.xml");
     scanner.addSystemProtocol("stable/viewporter/viewporter.xml");
+    // The pointer's shape - a resize arrow over a pane's edge - as the
+    // compositor draws it; the tablet protocol is what it refers to.
+    scanner.addSystemProtocol("unstable/tablet/tablet-unstable-v2.xml");
+    scanner.addSystemProtocol("staging/cursor-shape/cursor-shape-v1.xml");
     // Mica: the compositor blurs the wallpaper behind the window.
     scanner.addSystemProtocol("staging/ext-background-effect/ext-background-effect-v1.xml");
     // The title bar drawn here - the tabs in it - and the frame round it the
@@ -26,6 +30,7 @@ pub fn build(b: *std.Build) void {
     scanner.generate("wl_data_device_manager", 3);
     scanner.generate("wp_fractional_scale_manager_v1", 1);
     scanner.generate("wp_viewporter", 1);
+    scanner.generate("wp_cursor_shape_manager_v1", 1);
     scanner.generate("ext_background_effect_manager_v1", 1);
     scanner.generate("fluxion_window_manager_v1", 1);
     scanner.generate("wl_shm", 1);
