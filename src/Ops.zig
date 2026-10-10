@@ -78,6 +78,39 @@ pub fn newTextFile(io: std.Io, dir: []const u8, buffer: []u8) ![]const u8 {
     return name;
 }
 
+/// `names` in `dir` hidden - written into the folder's `.hidden`, as GTK's
+/// and KDE's file managers read it - or shown again. Windows' "Hide
+/// selected items", and Properties' Hidden.
+pub fn setHidden(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, names: []const []const u8, hidden: bool) !void {
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const file = try join(&path_buffer, dir, ".hidden");
+    const was = std.Io.Dir.cwd().readFileAlloc(io, file, gpa, .limited(1 << 20)) catch try gpa.dupe(u8, "");
+    defer gpa.free(was);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var lines = std.mem.tokenizeScalar(u8, was, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        const named = for (names) |n| {
+            if (std.mem.eql(u8, n, line)) break true;
+        } else false;
+        // Each once; shown again, gone from the list.
+        if (named) continue;
+        try out.appendSlice(gpa, line);
+        try out.append(gpa, '\n');
+    }
+    if (hidden) for (names) |n| {
+        try out.appendSlice(gpa, n);
+        try out.append(gpa, '\n');
+    };
+    // Nothing hidden: no list.
+    if (out.items.len == 0) {
+        std.Io.Dir.cwd().deleteFile(io, file) catch {};
+        return;
+    }
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = out.items });
+}
+
 /// `old` in `dir` named `new` - never over one already called that.
 pub fn rename(io: std.Io, dir: []const u8, old: []const u8, new: []const u8) !void {
     if (!validName(new)) return error.BadName;

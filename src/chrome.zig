@@ -683,6 +683,11 @@ fn moreMenu(self: *Files, kit: *Kit) void {
         close(self);
         return self.openNewWindow();
     }
+    menus_mod.separator(self, kit);
+    if (menus_mod.row(self, kit, "menu/more/options", "Options", .{ .icon = .settings })) {
+        close(self);
+        return @import("options.zig").open(self);
+    }
 }
 
 fn newMenu(self: *Files, kit: *Kit) void {

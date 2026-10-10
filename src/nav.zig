@@ -90,6 +90,19 @@ fn isDir(self: *Files, dir: []const u8, name: []const u8) bool {
     return stat.kind == .directory;
 }
 
+/// Folder Options' "Expand to open folder": every folder `path` is in
+/// opened in the tree, so the folder shown is in sight in it.
+pub fn expandTo(self: *Files, path: []const u8) void {
+    self.this_pc_open = true;
+    var end: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, path, end + 1, '/')) |slash| : (end = slash) {
+        const prefix = if (slash == 0) "/" else path[0..slash];
+        if (openedAt(self, prefix) != null) continue;
+        const read = readFolders(self, prefix) orelse continue;
+        self.nav_opened.append(self.gpa, read) catch read.free(self.gpa);
+    }
+}
+
 /// Forget the tree: the folders it shows read again as they are opened.
 pub fn forget(self: *Files) void {
     for (self.nav_opened.items) |o| o.free(self.gpa);
@@ -142,6 +155,11 @@ pub fn pane(self: *Files, kit: *Kit) void {
         }
         if (self.quick_open) pinnedFolders(self, kit, &going, 1, chevrons);
         gap(kit);
+        // Folder Options' "Show all folders": the home folder too.
+        if (self.prefs.show_all_folders) {
+            folderRow(self, kit, &going, "nav/home-folder", 0, self.places.home, std.fs.path.basename(self.places.home), "user-home", false, chevrons);
+            gap(kit);
+        }
         switch (row(self, kit, "nav/pc", 0, .{ .glyph = .desktop }, "This PC", here == .this_pc, if (chevrons) self.this_pc_open else null, false)) {
             .go => going.to = .this_pc,
             .toggle => self.this_pc_open = !self.this_pc_open,
@@ -155,6 +173,7 @@ pub fn pane(self: *Files, kit: *Kit) void {
         _ = row(self, kit, "nav/network", 0, .{ .glyph = .globe }, "Network", false, if (chevrons) false else null, false);
     } else {
         if (row(self, kit, "nav/home", 0, .{ .glyph = .home }, "Home", here == .home, null, false) == .go) going.to = .home;
+        if (self.prefs.show_all_folders) folderRow(self, kit, &going, "nav/home-folder", 0, self.places.home, std.fs.path.basename(self.places.home), "user-home", false, chevrons);
         separator(kit);
         pinnedFolders(self, kit, &going, 0, chevrons);
         separator(kit);

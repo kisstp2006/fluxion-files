@@ -201,6 +201,8 @@ repeat_at_ms: i64 = 0,
 repeat_delay_ms: i32 = 400,
 repeat_rate_ms: i32 = 33,
 watches: [8]Watch = undefined,
+/// The key typed last, by where it is on the keyboard.
+last_keycode: u32 = 0,
 watch_count: usize = 0,
 /// When to draw again with nothing else happening - a countdown's next
 /// second - or nought.
@@ -1066,6 +1068,15 @@ fn keyboardListener(_: *wl.Keyboard, event: wl.Keyboard.Event, self: *Window) vo
     }
 }
 
+/// What the key typed last is without Shift or AltGr: "2" for the key
+/// that types "@" - or, on a Hungarian keyboard, '"' - with Shift.
+/// Shortcuts such as Ctrl+Shift+2 go by where a key is, not what it types.
+pub fn baseSym(self: *const Window) u32 {
+    const keymap = self.xkb_keymap orelse return 0;
+    const syms = keymap.keyGetSymsByLevel(self.last_keycode, 0, 0);
+    return if (syms.len > 0) @intFromEnum(syms[0]) else 0;
+}
+
 /// Whether the modifier `name` - xkb's "Control", "Shift", "Mod1" for
 /// Alt, "Mod4" for Super - is held.
 pub fn modifierHeld(self: *const Window, name: [*:0]const u8) bool {
@@ -1078,6 +1089,7 @@ pub fn modifierHeld(self: *const Window, name: [*:0]const u8) bool {
 fn typeKey(self: *Window, code: u32) void {
     const state = self.xkb_state orelse return;
     const sym = state.keyGetOneSym(code);
+    self.last_keycode = code;
     self.input_since_drawn = true;
     if (self.content.key) |hook| if (hook(self.content.context, self, sym)) {
         self.redraw();

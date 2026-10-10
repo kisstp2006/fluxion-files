@@ -60,4 +60,7 @@ test {
     _ = @import("Archive.zig");
     _ = @import("Preview.zig");
     _ = @import("Jobs.zig");
+    _ = @import("Undo.zig");
+    _ = @import("History.zig");
+    _ = @import("FolderViews.zig");
 }

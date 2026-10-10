@@ -68,6 +68,9 @@ pub const Group = struct {
     }
 };
 
+/// Details' columns as they come: Name, Date modified, Type, Size.
+pub const default_columns: u16 = 0b1111;
+
 /// Windows' eight views, in Ctrl+Shift+1…8's order.
 pub const View = enum { extra_large, large, medium, small, list, details, tiles, content };
 
@@ -81,6 +84,10 @@ sort_by: Folder.Column = .name,
 ascending: bool = true,
 /// Grouped by a column, Windows' way - or not.
 group_by: ?Folder.Column = null,
+/// The columns Details shows, a bit each by `Folder.Column`; and how wide
+/// each is dragged to - nought for its own width.
+columns: u16 = default_columns,
+widths: [Folder.column_count]u16 = @splat(0),
 groups: std.ArrayList(Group) = .empty,
 /// The entries shown - the folder's, hidden ones left out unless asked for -
 /// as indices into the folder's, in order.
@@ -331,8 +338,14 @@ fn groupOf(e: *const Folder.Entry, by: Folder.Column, now: i64) GroupKey {
             if (c >= 'Q' and c <= 'Z') return .{ .rank = 3, .label = "Q - Z" };
             return .{ .rank = 4, .label = "Other" };
         },
-        .modified => {
-            const t: i64 = @intCast(@divFloor(e.mtime, std.time.ns_per_s));
+        .modified, .created, .accessed => {
+            const stamp = switch (by) {
+                .created => e.created,
+                .accessed => e.accessed,
+                else => e.mtime,
+            };
+            if (stamp == 0) return .{ .rank = 8, .label = "Unspecified" };
+            const t: i64 = @intCast(@divFloor(stamp, std.time.ns_per_s));
             const day = 24 * 60 * 60;
             const today = now - @mod(now - localOffset(now), day);
             if (t >= today) return .{ .rank = 0, .label = "Today" };
@@ -354,6 +367,15 @@ fn groupOf(e: *const Folder.Entry, by: Folder.Column, now: i64) GroupKey {
             if (s < 1 << 30) return .{ .rank = 4, .label = "Large (128 MB - 1 GB)" };
             if (s < 4 << 30) return .{ .rank = 5, .label = "Huge (1 - 4 GB)" };
             return .{ .rank = 6, .label = "Gigantic (> 4 GB)" };
+        },
+        .attributes => {
+            if (e.mode != 0 and e.mode & 0o222 == 0) return .{ .rank = 0, .label = "Read-only" };
+            if (e.hidden) return .{ .rank = 1, .label = "Hidden" };
+            return .{ .rank = 2, .label = "Normal" };
+        },
+        .owner => {
+            const mine = e.uid == std.os.linux.getuid();
+            return if (mine) .{ .rank = 0, .label = "You" } else .{ .rank = 1, .label = "Others" };
         },
         // By kind: folders, then the media, then the rest.
         .type => {

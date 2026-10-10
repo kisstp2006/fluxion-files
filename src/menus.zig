@@ -72,6 +72,7 @@ pub fn context(self: *Files, kit: *Kit) void {
     defer end(kit);
     const t = self.tab();
     const full = self.ten() or self.context_more;
+    if (t.location == .home and self.context_on_item) return homeMenu(self, kit);
     if (t.location == .trash) {
         if (self.context_on_item) trashItemMenu(self, kit) else trashMenu(self, kit);
     } else if (self.context_on_item) {
@@ -303,6 +304,17 @@ fn itemMenu(self: *Files, kit: *Kit) void {
         return;
     }
     if (!folder and one) subRow(self, kit, "context/open-with", "Open with", .apps, .open_with, false);
+    // Windows 11's favorites: starred, a file is on Home's list of them.
+    if (!folder and one and !t.inArchive()) if (chosenPath(self)) |path| {
+        self.history.refresh(self.io);
+        const starred = self.history.isFavorite(path);
+        if (row(self, kit, "context/favorite", if (starred) "Remove from Favorites" else "Add to Favorites", .{ .icon = .star })) {
+            var buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const copy = std.fmt.bufPrint(&buffer, "{s}", .{path}) catch return;
+            done(self);
+            return self.history.setFavorite(self.io, copy, !starred);
+        }
+    };
     if (t.location == .search and one) if (row(self, kit, "context/location", "Open file location", .{ .icon = .folder_open })) {
         done(self);
         return self.openFileLocation();
@@ -449,6 +461,55 @@ fn trashItemMenu(self: *Files, kit: *Kit) void {
     if (row(self, kit, "context/properties", "Properties", .{ .icon = if (self.ten()) null else .info, .shortcut = if (self.ten()) null else "Alt+Enter" })) {
         done(self);
         return self.openProperties();
+    }
+}
+
+/// A thing of Home's: open it, go where it is, star it or not, take it
+/// off the list it is on.
+fn homeMenu(self: *Files, kit: *Kit) void {
+    const ten = self.ten();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&buffer, "{s}", .{self.home_target_buffer[0..self.home_target_len]}) catch return;
+    const folder = self.home_kind == .frequent;
+    if (row(self, kit, "context/home/open", "Open", .{ .strong = ten, .icon = if (ten) null else .open })) {
+        done(self);
+        if (folder) return self.goTo(.{ .folder = path });
+        const mime = self.mime.byName(std.fs.path.basename(path)) orelse "application/octet-stream";
+        return self.openFile(path, mime);
+    }
+    if (!folder) if (row(self, kit, "context/home/location", "Open file location", .{ .icon = if (ten) null else .folder_open })) {
+        done(self);
+        var dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const dir = std.fmt.bufPrint(&dir_buffer, "{s}", .{std.fs.path.dirname(path) orelse "/"}) catch return;
+        self.goTo(.{ .folder = dir });
+        return actions.choose(self, &.{std.fs.path.basename(path)});
+    };
+    if (folder) if (row(self, kit, "context/home/pin", "Pin to Quick access", .{ .icon = if (ten) null else .pin })) {
+        done(self);
+        self.places.togglePin(self.io, path);
+        return;
+    };
+    separator(self, kit);
+    if (!folder and !ten) {
+        const starred = self.history.isFavorite(path);
+        if (row(self, kit, "context/home/favorite", if (starred) "Remove from Favorites" else "Add to Favorites", .{ .icon = .star })) {
+            done(self);
+            return self.history.setFavorite(self.io, path, !starred);
+        }
+    }
+    if (self.home_kind == .recent) if (row(self, kit, "context/home/remove", if (ten) "Remove from Quick access" else "Remove from Recent", .{ .icon = if (ten) null else .dismiss })) {
+        done(self);
+        return self.history.hide(self.io, &.{path});
+    };
+    if (row(self, kit, "context/home/path", "Copy as path", .{ .icon = if (ten) null else .clipboard_paste })) {
+        done(self);
+        var text_buffer: [std.fs.max_path_bytes + 2]u8 = undefined;
+        return self.window.copyText(std.fmt.bufPrint(&text_buffer, "\"{s}\"", .{path}) catch return);
+    }
+    separator(self, kit);
+    if (row(self, kit, "context/home/properties", "Properties", .{ .icon = if (ten) null else .info })) {
+        done(self);
+        return @import("properties.zig").open(self, path, folder, if (folder) @import("Mime.zig").directory else self.mime.byName(std.fs.path.basename(path)) orelse "application/octet-stream");
     }
 }
 

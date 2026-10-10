@@ -31,6 +31,7 @@ const menus = @import("menus.zig");
 const actions = @import("actions.zig");
 const win10 = @import("win10.zig");
 const drag = @import("drag.zig");
+const History = @import("History.zig");
 
 const scroll_id = "view/scroll";
 
@@ -100,10 +101,31 @@ fn shownName(self: *Files, e: *const Folder.Entry) []const u8 {
     return if (dot == 0) e.name else e.name[0..dot];
 }
 
+/// How long the pointer rests on an item before it is chosen by it - in
+/// single-click mode - and its description pops up.
+const rest_ms = 600;
+
 /// A right click on item `i`: chosen, if it was not, and its menu; a
-/// middle click on a folder: it in a new tab.
+/// middle click on a folder: it in a new tab. The pointer resting on it,
+/// and - in single-click mode - a click opening it.
 fn requests(self: *Files, u: *ui.Ui, id: []const u8, i: usize) void {
     const t = self.tab();
+    if (u.isPointerOver(id) and !self.window.down) {
+        self.hover_seen = true;
+        const now = Window.nowMs();
+        if (self.hover_item != i) {
+            self.hover_item = i;
+            self.hover_since = now;
+            self.window.wakeAt(now + rest_ms);
+        } else if (now - self.hover_since >= rest_ms and self.prefs.single_click and t.selectedCount() <= 1 and !t.selected.items[i]) {
+            // Single-click mode: pointed to, it is chosen.
+            t.click(i, false, false);
+        }
+    }
+    if (self.prefs.single_click and u.isElementReleased(id) and self.window.clickCount() < 2 and !self.window.modifierHeld("Control") and !self.window.modifierHeld("Shift")) {
+        self.open(i, false);
+        return;
+    }
     if (self.context_at) |at| if (u.isPointerOver(id)) {
         if (!t.selected.items[i]) t.click(i, false, false);
         menus.openAt(self, at, true);
@@ -120,6 +142,21 @@ fn requests(self: *Files, u: *ui.Ui, id: []const u8, i: usize) void {
 fn nameOrField(self: *Files, kit: *Kit, i: usize, e: *const Folder.Entry, style: ui.TextStyle) void {
     const u = kit.ui;
     if (self.renaming != i) {
+        // Single-click mode: names underlined, as links are - always, or
+        // under the pointer - and lit there.
+        if (self.prefs.single_click) {
+            var buffer: [32]u8 = undefined;
+            const hovered = u.isPointerOver(std.fmt.bufPrint(&buffer, "item/{d}", .{i}) catch "");
+            if (self.prefs.underline == .always or hovered) {
+                var link = style;
+                if (hovered) link.color = if (kit.theme.palette.mode == .dark) widgets.argb(0xFF6CB4F2) else widgets.argb(0xFF0066CC);
+                u.open(.{ .direction = .top_to_bottom, .align_x = if (style.alignment == .center) .center else .left });
+                defer u.close();
+                u.text(shownName(self, e), link);
+                u.empty(.{ .width = .grow, .height = .fixed(1), .background_color = link.color });
+                return;
+            }
+        }
         u.text(shownName(self, e), style);
         return;
     }
@@ -151,6 +188,11 @@ fn pressed(self: *Files, i: usize) void {
     const w = &self.window;
     const ctrl = w.modifierHeld("Control");
     const shift = w.modifierHeld("Shift");
+    // Single-click mode: a click opens - when it comes up.
+    if (self.prefs.single_click and !ctrl and !shift) {
+        t.click(i, false, false);
+        return;
+    }
     if (w.clickCount() >= 2 and !ctrl and !shift) {
         self.rename_pending = null;
         if (t.location == .trash) return self.openProperties();
@@ -318,6 +360,117 @@ fn listView(self: *Files, kit: *Kit) void {
     }
     rubberBand(self, kit);
     answerDrop(self, u);
+    infotip(self, kit);
+}
+
+/// Folder Options' "Show pop-up description": the item the pointer rests
+/// on, said in a tip beside it - a file's kind, size and date; a folder's
+/// date, size and what is in it.
+fn infotip(self: *Files, kit: *Kit) void {
+    if (!self.hover_seen) self.hover_item = null;
+    self.hover_seen = false;
+    const i = self.hover_item orelse return;
+    if (!self.prefs.infotips or self.window.down or self.menu != .none or self.context_open != null or self.window.dragOver()) return;
+    if (Window.nowMs() - self.hover_since < rest_ms) return;
+    const t = self.tab();
+    if (i >= t.count()) return;
+    const at = self.window.pointer_at orelse return;
+    if (self.tip_item != i) {
+        self.tip_item = i;
+        self.tip_len = describe(self, t, i).len;
+    }
+    const u = kit.ui;
+    const p = &kit.theme.palette;
+    const ten = self.ten();
+    u.open(.{
+        .id = "infotip",
+        .direction = .top_to_bottom,
+        .padding = .xy(8, 5),
+        .gap = 1,
+        .background_color = if (ten) (if (p.mode == .dark) widgets.argb(0xFF2B2B2B) else widgets.argb(0xFFFFFFFF)) else p.flyout,
+        .border = .{ .color = if (ten) (if (p.mode == .dark) widgets.argb(0xFF767676) else widgets.argb(0xFF767676)) else p.surface_stroke_flyout, .width = .all(1) },
+        .corner_radius = .all(if (ten) 0 else 4),
+        .shadow = kit.elevation(.tooltip),
+        .floating = .{ .attach = .root, .offset = .{ .x = at[0] + 12, .y = at[1] + 20 }, .z_index = 115, .keep_on_screen = true },
+        .passthrough = true,
+    });
+    defer u.close();
+    var style = kit.style(.caption, p.text_primary);
+    style.wrap = .none;
+    var said = std.mem.splitScalar(u8, self.tip_buffer[0..self.tip_len], '\n');
+    while (said.next()) |line| u.text(line, style);
+}
+
+/// What the tip says of item `i`, into the window's buffer for it.
+fn describe(self: *Files, t: *Tab, i: usize) []const u8 {
+    const e = t.entry(i);
+    var w: std.Io.Writer = .fixed(&self.tip_buffer);
+    var date_buffer: [32]u8 = undefined;
+    var size_buffer: [32]u8 = undefined;
+    if (!e.isFolder()) {
+        var type_buffer: [64]u8 = undefined;
+        w.print("Type: {s}\nSize: {s}\nDate modified: {s}", .{ self.mime.describe(e.mime, e.name, &type_buffer), Folder.sizeText(e.size, &size_buffer), dateText(e.mtime, &date_buffer) }) catch {};
+        return w.buffered();
+    }
+    w.print("Date created: {s}", .{dateText(if (e.created != 0) e.created else e.mtime, &date_buffer)}) catch {};
+    // What is in it, at the first level: its folders and files by name.
+    const dir = t.dirOf(e) orelse return w.buffered();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const full = @import("Ops.zig").join(&path_buffer, dir, e.name) catch return w.buffered();
+    var folder = std.Io.Dir.cwd().openDir(self.io, full, .{ .iterate = true }) catch return w.buffered();
+    defer folder.close(self.io);
+    var folders: [4][]const u8 = undefined;
+    var files: [4][]const u8 = undefined;
+    var names_buffer: [8][128]u8 = undefined;
+    var nf: usize = 0;
+    var nd: usize = 0;
+    var more_folders = false;
+    var more_files = false;
+    var bytes: u64 = 0;
+    var all_files = true;
+    var seen: usize = 0;
+    var it = folder.iterate();
+    while (it.next(self.io) catch null) |entry| {
+        if (entry.name[0] == '.' and !self.show_hidden) continue;
+        seen += 1;
+        if (seen > 2000) break;
+        if (entry.kind == .directory) {
+            all_files = false;
+            if (nd < folders.len) {
+                const n = @min(entry.name.len, 127);
+                @memcpy(names_buffer[nd][0..n], entry.name[0..n]);
+                folders[nd] = names_buffer[nd][0..n];
+                nd += 1;
+            } else more_folders = true;
+        } else {
+            if (self.prefs.folder_size_tips) if (folder.statFile(self.io, entry.name, .{})) |st| {
+                bytes += st.size;
+            } else |_| {};
+            if (nf < files.len) {
+                const n = @min(entry.name.len, 127);
+                @memcpy(names_buffer[4 + nf][0..n], entry.name[0..n]);
+                files[nf] = names_buffer[4 + nf][0..n];
+                nf += 1;
+            } else more_files = true;
+        }
+    }
+    if (seen == 0) {
+        w.writeAll("\nEmpty folder") catch {};
+        return w.buffered();
+    }
+    // Its size, where only files are in it: the rest would take a while.
+    if (self.prefs.folder_size_tips and all_files) w.print("\nSize: {s}", .{Folder.sizeText(bytes, &size_buffer)}) catch {};
+    if (nd > 0) {
+        w.writeAll("\nFolders: ") catch {};
+        for (folders[0..nd], 0..) |f, k| w.print("{s}{s}", .{ if (k > 0) ", " else "", f }) catch {};
+        if (more_folders) w.writeAll(", ...") catch {};
+    }
+    if (nf > 0) {
+        w.writeAll("\nFiles: ") catch {};
+        for (files[0..nf], 0..) |f, k| w.print("{s}{s}", .{ if (k > 0) ", " else "", f }) catch {};
+        if (more_files) w.writeAll(", ...") catch {};
+    }
+    return w.buffered();
 }
 
 /// A drag over the list: into the folder under the pointer, or else into
@@ -735,7 +888,7 @@ fn iconCell(self: *Files, kit: *Kit, i: usize, cell: [2]f32, icon: u16) void {
 /// A picture's own thumbnail where the system's cache has one: the
 /// freedesktop thumbnail spec's, made by any app that showed it.
 fn thumbnail(self: *Files, kit: *Kit, i: usize, size: u16) bool {
-    if (size < 48) return false;
+    if (size < 48 or self.prefs.always_icons) return false;
     const t = self.tab();
     const e = t.entry(i);
     if (!std.mem.startsWith(u8, e.mime, "image/") and !std.mem.startsWith(u8, e.mime, "video/")) return false;
@@ -960,31 +1113,155 @@ fn placeTile(self: *Files, kit: *Kit, id: []const u8, icon_name: []const u8, nam
 
 fn homePage(self: *Files, kit: *Kit) void {
     const u = kit.ui;
+    const ten = self.ten();
+    self.history.refresh(self.io);
     u.open(.{ .id = scroll_id, .width = .grow, .height = .grow, .direction = .top_to_bottom, .padding = .xy(12, 4), .clip = scrollClip(kit) });
     defer u.close();
     var to: ?[]const u8 = null;
     var to_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const frequent = self.places.user.items.len + self.places.pinned.items.len;
-    if (self.ten()) section(self, kit, kit.print("Frequent folders ({d})", .{frequent})) else section(self, kit, "Quick access");
+    // Gone to often, and not shown already: the frequent folders.
+    var frequent_buffer: [History.most_frequent]History.Frequent = undefined;
+    const frequent = if (self.prefs.show_frequent) self.history.topFolders(&frequent_buffer, shownAlready, self) else &.{};
+    const tiles = self.places.user.items.len + self.places.pinned.items.len + frequent.len;
+    if (ten) section(self, kit, kit.print("Frequent folders ({d})", .{tiles})) else section(self, kit, "Quick access");
     {
         u.open(.{ .width = .grow, .wrap = true, .gap = 4, .wrap_gap = 4, .padding = .xy(8, 0) });
         defer u.close();
         for (self.places.user.items, 0..) |f, i| {
-            if (placeTile(self, kit, kit.print("home/user/{d}", .{i}), icons.special(f.special), f.name, if (self.ten()) "This PC" else "Stored locally", true)) to = std.fmt.bufPrint(&to_buffer, "{s}", .{f.path}) catch null;
+            if (placeTile(self, kit, kit.print("home/user/{d}", .{i}), icons.special(f.special), f.name, if (ten) "This PC" else "Stored locally", true)) to = std.fmt.bufPrint(&to_buffer, "{s}", .{f.path}) catch null;
             drag.answerFolder(self, u, kit.print("home/user/{d}", .{i}), f.path);
         }
         for (self.places.pinned.items, 0..) |f, i| {
             if (placeTile(self, kit, kit.print("home/pin/{d}", .{i}), "folder", f.name, std.fs.path.dirname(f.path) orelse "/", true)) to = std.fmt.bufPrint(&to_buffer, "{s}", .{f.path}) catch null;
             drag.answerFolder(self, u, kit.print("home/pin/{d}", .{i}), f.path);
         }
+        for (frequent, 0..) |f, i| {
+            const id = kit.print("home/frequent/{d}", .{i});
+            if (placeTile(self, kit, id, "folder", std.fs.path.basename(f.path), std.fs.path.dirname(f.path) orelse "/", false)) to = std.fmt.bufPrint(&to_buffer, "{s}", .{f.path}) catch null;
+            drag.answerFolder(self, u, id, f.path);
+            homeMenuOn(self, u, id, f.path, .frequent);
+        }
     }
-    if (!self.ten()) {
+    if (!ten and self.prefs.show_favorites) {
         section(self, kit, "Favorites");
-        emptyNote(kit, "After you've favorited some files, we'll show them here.");
+        if (self.history.favorites.items.len == 0) {
+            emptyNote(kit, "After you've favorited some files, we'll show them here.");
+        } else {
+            fileHeader(self, kit);
+            for (self.history.favorites.items, 0..) |path, i| {
+                const mime = self.mime.byName(std.fs.path.basename(path)) orelse "application/octet-stream";
+                fileRow(self, kit, kit.print("home/favorite/{d}", .{i}), path, mime, .favorite);
+            }
+        }
     }
-    section(self, kit, if (self.ten()) "Recent files (0)" else "Recent");
-    emptyNote(kit, "After you've opened some files, we'll show the most recent ones here.");
+    if (self.prefs.show_recent) {
+        const recent = self.history.recent;
+        section(self, kit, if (ten) kit.print("Recent files ({d})", .{recent.len}) else "Recent");
+        if (recent.len == 0) {
+            emptyNote(kit, "After you've opened some files, we'll show the most recent ones here.");
+        } else {
+            if (!ten) fileHeader(self, kit);
+            for (recent, 0..) |f, i| {
+                const mime = if (f.mime.len > 0) f.mime else self.mime.byName(f.name) orelse "application/octet-stream";
+                fileRow(self, kit, kit.print("home/recent/{d}", .{i}), f.path, mime, .recent);
+            }
+        }
+    }
     if (to) |path| self.goTo(.{ .folder = path });
+}
+
+/// A folder Home shows as a tile already: one of the person's, or pinned.
+fn shownAlready(context: *const anyopaque, path: []const u8) bool {
+    const self: *const Files = @ptrCast(@alignCast(context));
+    for (self.places.user.items) |f| if (std.mem.eql(u8, f.path, path)) return true;
+    if (self.places.isPinned(path)) return true;
+    return std.mem.eql(u8, path, self.places.home);
+}
+
+/// Windows 11's heads over Home's lists: Name, Date modified, File location.
+fn fileHeader(self: *Files, kit: *Kit) void {
+    _ = self;
+    const u = kit.ui;
+    const p = &kit.theme.palette;
+    u.open(.{ .width = .grow, .height = .fixed(28), .padding = .xy(16, 0), .align_y = .center });
+    defer u.close();
+    var style = kit.style(.caption, p.text_secondary);
+    style.wrap = .none;
+    u.open(.{ .width = .growWith(.{ .min = 160 }) });
+    u.text("Name", style);
+    u.close();
+    u.open(.{ .width = .fixedDownTo(150, 90) });
+    u.text("Date modified", style);
+    u.close();
+    u.open(.{ .width = .fixedDownTo(280, 120), .clip = .both });
+    u.text("File location", style);
+    u.close();
+}
+
+/// A file of Home's lists: its icon, its name, when it changed, where it is
+/// - Windows 10's with only where, grey, at the right. A click chooses it,
+/// a double click opens it, a right click has its menu.
+fn fileRow(self: *Files, kit: *Kit, id: []const u8, path: []const u8, mime: []const u8, kind: Files.HomeKind) void {
+    const u = kit.ui;
+    const p = &kit.theme.palette;
+    const ten = self.ten();
+    const lit = self.page_chosen != null and std.mem.eql(u8, self.page_chosen_buffer[0..self.page_chosen_len], id);
+    const hovered = u.isPointerOver(id);
+    u.open(.{
+        .id = id,
+        .width = .grow,
+        .height = .fixed(if (ten) 24 else 32),
+        .padding = .xy(if (ten) 8 else 16, 0),
+        .gap = 8,
+        .align_y = .center,
+        .corner_radius = .all(if (ten) 0 else 4),
+        .background_color = itemFill(self, kit, lit, hovered),
+        .border = if (ten and (lit or hovered)) .{ .color = if (lit) win10Edge(kit) else win10.hoverColor(kit), .width = .all(1) } else .{},
+    });
+    defer u.close();
+    var name_style = kit.style(.caption, p.text_primary);
+    name_style.wrap = .none;
+    var small = kit.style(.caption, p.text_secondary);
+    small.wrap = .none;
+    const dir = std.fs.path.dirname(path) orelse "/";
+    {
+        u.open(.{ .width = .growWith(.{ .min = 160 }), .gap = 8, .align_y = .center, .clip = .both });
+        defer u.close();
+        @import("panes.zig").fileIcon(self, kit, std.fs.path.basename(path), 16);
+        u.text(std.fs.path.basename(path), name_style);
+        if (!ten and kind == .favorite) kit.icon(.star, 12, p.accent, .filled);
+    }
+    if (!ten) {
+        var date_buffer: [32]u8 = undefined;
+        const stat = std.Io.Dir.cwd().statFile(self.io, path, .{}) catch null;
+        u.open(.{ .width = .fixedDownTo(150, 90), .clip = .both });
+        u.text(kit.print("{s}", .{if (stat) |st| dateText(st.mtime.nanoseconds, &date_buffer) else ""}), small);
+        u.close();
+    }
+    u.open(.{ .width = .fixedDownTo(280, 120), .clip = .both });
+    u.text(kit.print("{s}", .{dir}), small);
+    u.close();
+    if (u.justPressed()) {
+        if (self.window.clickCount() >= 2) {
+            var buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const copy = std.fmt.bufPrint(&buffer, "{s}", .{path}) catch return;
+            self.openFile(copy, mime);
+        } else self.choosePageItem(id);
+    }
+    homeMenuOn(self, u, id, path, kind);
+}
+
+/// A right click on a thing of Home's: its own menu - open, go to where it
+/// is, star it, take it off the list.
+fn homeMenuOn(self: *Files, u: *ui.Ui, id: []const u8, path: []const u8, kind: Files.HomeKind) void {
+    const at = self.context_at orelse return;
+    if (!u.isPointerOver(id)) return;
+    self.choosePageItem(id);
+    self.home_target_len = @min(path.len, self.home_target_buffer.len);
+    @memcpy(self.home_target_buffer[0..self.home_target_len], path[0..self.home_target_len]);
+    self.home_kind = kind;
+    menus.openAt(self, at, true);
+    self.context_at = null;
 }
 
 fn emptyNote(kit: *Kit, text: []const u8) void {
@@ -1014,6 +1291,8 @@ fn thisPcPage(self: *Files, kit: *Kit) void {
     section(self, kit, kit.print("Devices and drives ({d})", .{self.places.drives.items.len}));
     u.open(.{ .width = .grow, .wrap = true, .gap = 4, .wrap_gap = 4, .padding = .xy(8, 0) });
     for (self.places.drives.items, 0..) |d, i| {
+        // Folder Options' "Hide empty drives": a drive with nothing in it.
+        if (self.prefs.hide_empty_drives and d.size == 0) continue;
         if (driveTile(self, kit, kit.print("pc/drive/{d}", .{i}), d)) to = std.fmt.bufPrint(&to_buffer, "{s}", .{d.mount}) catch null;
         drag.answerFolder(self, u, kit.print("pc/drive/{d}", .{i}), d.mount);
     }

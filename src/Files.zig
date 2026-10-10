@@ -54,6 +54,9 @@ const Undo = @import("Undo.zig");
 const progress = @import("progress.zig");
 const archives = @import("archives.zig");
 const chooser_mod = @import("chooser.zig");
+const options_mod = @import("options.zig");
+const History = @import("History.zig");
+const FolderViews = @import("FolderViews.zig");
 const Archive = @import("Archive.zig");
 
 const Files = @This();
@@ -206,6 +209,26 @@ deciding: ?u32 = null,
 wizard: ?archives.Wizard = null,
 /// "Choose another app", open.
 chooser: ?chooser_mod.Chooser = null,
+/// Folder Options, open; and its drop-down open.
+options: ?options_mod.Options = null,
+options_dropdown: bool = false,
+/// The item the pointer rests on, and since when: chosen by it in
+/// single-click mode, its pop-up description shown after a moment; and
+/// that description, made once for it.
+hover_item: ?usize = null,
+hover_since: i64 = 0,
+hover_seen: bool = false,
+tip_item: ?usize = null,
+tip_buffer: [1024]u8 = undefined,
+tip_len: usize = 0,
+/// A thing of Home's right-clicked: its path, and which list it is on.
+home_target_buffer: [std.fs.max_path_bytes]u8 = undefined,
+home_target_len: usize = 0,
+home_kind: HomeKind = .recent,
+/// Home's recent files, frequent folders and favorites; and each folder
+/// as it was shown.
+history: History = undefined,
+folder_views: FolderViews = undefined,
 show_after_buffer: [std.fs.max_path_bytes]u8 = undefined,
 show_after_len: usize = 0,
 decide_source: std.ArrayList(bool) = .empty,
@@ -214,6 +237,8 @@ decide_dest: std.ArrayList(bool) = .empty,
 pub const Menu = enum { none, view, sort, group, more, new, file, move_to, copy_to, recent, tab, crumb, qat };
 pub const Confirm = enum { delete_permanently, empty_trash };
 pub const Pane = enum { none, details, preview };
+/// Which of Home's lists a thing is on.
+pub const HomeKind = enum { recent, favorite, frequent };
 pub const RibbonTab = enum { home, share, view, manage, search };
 
 pub fn init(self: *Files, gpa: std.mem.Allocator, io: std.Io, start: ?[]const u8) !void {
@@ -273,6 +298,8 @@ pub fn init(self: *Files, gpa: std.mem.Allocator, io: std.Io, start: ?[]const u8
     self.player = .init(gpa, io, self.work_wake[1]);
     self.jobs = .init(gpa, io, self.work_wake[1]);
     self.undo = .init(gpa);
+    self.history = .init(gpa);
+    self.folder_views = .init(gpa);
     self.progress_more = prefs.transfer_details;
     // Folder Options' "Open File Explorer to".
     const first: Tab.Location = if (start) |p| startPlace(p) else if (prefs.open_to == .this_pc) .this_pc else .home;
@@ -302,6 +329,8 @@ pub fn deinit(self: *Files) void {
     };
     self.jobs.deinit();
     self.undo.deinit();
+    self.history.deinit();
+    self.folder_views.deinit();
     self.decide_source.deinit(self.gpa);
     self.decide_dest.deinit(self.gpa);
     self.player.deinit();
@@ -395,6 +424,16 @@ pub fn openNewWindow(self: *Files) void {
     apps_mod.run(self.gpa, self.io, "Files", line, null);
 }
 
+/// Another window of Files at `path`.
+pub fn openWindowAt(self: *Files, path: []const u8) void {
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(self.gpa);
+    line.appendSlice(self.gpa, "fluxion-files '") catch return;
+    for (path) |c| if (c == '\'') line.appendSlice(self.gpa, "'\\''") catch return else line.append(self.gpa, c) catch return;
+    line.append(self.gpa, '\'') catch return;
+    apps_mod.run(self.gpa, self.io, "Files", line.items, null);
+}
+
 pub fn switchTab(self: *Files, index: usize) void {
     if (index >= self.tabs.items.len) return;
     self.active = index;
@@ -455,6 +494,7 @@ pub fn togglePane(self: *Files, which: Pane) void {
 
 pub fn sortBy(self: *Files, by: Folder.Column) void {
     self.tab().sortBy(by, &self.mime, self.show_hidden);
+    self.folder_views.remember(self.io, self.tab());
     self.window.redraw();
 }
 
@@ -464,11 +504,13 @@ pub fn sortOrder(self: *Files, ascending: bool) void {
     t.ascending = ascending;
     if (t.folder) |*f| f.sort(t.sort_by, ascending, &self.mime);
     t.refilter(self.show_hidden);
+    self.folder_views.remember(self.io, t);
     self.window.redraw();
 }
 
 pub fn groupBy(self: *Files, by: ?Folder.Column) void {
     self.tab().groupBy(by, self.show_hidden);
+    self.folder_views.remember(self.io, self.tab());
     self.window.redraw();
 }
 
@@ -702,6 +744,13 @@ fn arrived(self: *Files) void {
     self.page_chosen = null;
     self.renaming = null;
     self.notice_len = 0;
+    // A folder shown as it was last - its view, its sort, its columns - and
+    // counted for Home's frequent folders.
+    if (t.folder == null) if (t.path()) |p| {
+        self.folder_views.applyTo(self.io, &self.places, t, p);
+        self.history.visited(self.io, p);
+        if (self.prefs.expand_to_open) nav.expandTo(self, p);
+    };
     if ((t.path() != null or t.location == .trash) and t.folder == null) t.read(self.io, &self.mime, self.show_hidden);
     // Left a search: it stops, and the box is emptied.
     if (t.location != .search) {
@@ -712,8 +761,15 @@ fn arrived(self: *Files) void {
     self.watchFolder();
     self.window.layout.scrollTo("view/scroll", 0, 0);
     var buffer: [256]u8 = undefined;
-    self.window.setTitle(self.titleOf(t, &buffer));
+    self.window.setTitle(self.windowTitleOf(t, &buffer));
     self.window.redraw();
+}
+
+/// What the window is called: its tab's name - or, as Folder Options' "Display
+/// the full path in the title bar" has it, the whole path.
+pub fn windowTitleOf(self: *Files, t: *const Tab, buffer: []u8) []const u8 {
+    if (self.prefs.full_path_title) if (t.path()) |p| return std.fmt.bufPrint(buffer, "{s}", .{p}) catch p;
+    return self.titleOf(t, buffer);
 }
 
 /// What a tab, and the window, is called: the folder's name, as Windows'.
@@ -750,7 +806,10 @@ pub fn open(self: *Files, i: usize, new_tab: bool) void {
     // A compressed folder opens as a folder, as Windows opens one.
     const folder = e.isFolder() or (Archive.named(e.name) and Archive.available() and !t.inArchive());
     if (folder) {
-        if (new_tab and !self.ten()) self.newTab(.{ .folder = full }) else self.goTo(.{ .folder = full });
+        if (new_tab and !self.ten()) return self.newTab(.{ .folder = full });
+        // Folder Options' "Open each folder in its own window".
+        if (self.prefs.own_window and !new_tab) return self.openWindowAt(full);
+        self.goTo(.{ .folder = full });
         return;
     }
     // In one: taken out first.
@@ -762,6 +821,8 @@ pub fn openFile(self: *Files, path: []const u8, mime: []const u8) void {
     const apps = self.installedApps() orelse return;
     // No app opens its kind yet: which is to, asked as Windows asks it.
     const app = self.open_with.defaultFor(apps, mime) orelse return chooser_mod.open(self, path, mime);
+    // On Home's Recent - and the start menu's Recommended.
+    self.history.opened(self.io, path, mime);
     apps_mod.runWith(self.gpa, self.io, app.name, app.exec, path);
 }
 
@@ -882,13 +943,14 @@ fn draw(context: *anyopaque, window: *Window, kit: *Kit) void {
         views.content(self, kit);
         panes.pane(self, kit);
     }
-    chrome.statusBar(self, kit);
+    if (self.prefs.status_bar) chrome.statusBar(self, kit);
     chrome.menus(self, kit);
     menus.context(self, kit);
     menus.confirmDialog(self, kit);
     progress.draw(self, kit);
     archives.wizard(self, kit);
     chooser_mod.draw(self, kit);
+    options_mod.draw(self, kit);
     property_sheet.draw(self, kit);
     drag.tip(self, kit);
     // A right or middle click on nothing that took it.
@@ -953,6 +1015,10 @@ fn key(context: *anyopaque, window: *Window, sym: xkb.Keysym) bool {
     }
     if (self.chooser != null) {
         if (code == K.Escape) self.chooser = null;
+        return code == K.Escape;
+    }
+    if (self.options != null) {
+        if (code == K.Escape) self.options = null;
         return code == K.Escape;
     }
     if (self.confirm != null) {
@@ -1024,12 +1090,13 @@ fn key(context: *anyopaque, window: *Window, sym: xkb.Keysym) bool {
             actions.copyAsPath(self);
             return true;
         }
-        // Shift with the digits types !"§$…: the keys by where they are.
-        const views_by_symbol = [_]u32{ K.exclam, K.at, K.numbersign, K.dollar, K.percent, K.asciicircum, K.ampersand, K.asterisk };
-        for (views_by_symbol, 0..) |s, i| if (code == s) {
-            self.setView(@enumFromInt(i));
+        // Shift with the digits types !"§$… - whatever the keyboard's
+        // layout: the keys by where they are.
+        const base = window.baseSym();
+        if (base >= K.@"1" and base <= K.@"8") {
+            self.setView(@enumFromInt(base - K.@"1"));
             return true;
-        };
+        }
     }
     if (ctrl) switch (code) {
         K.t, K.T => {
@@ -1154,6 +1221,7 @@ pub fn choosePageItem(self: *Files, id: []const u8) void {
 pub fn setView(self: *Files, view: Tab.View) void {
     self.tab().view = view;
     self.menu = .none;
+    self.folder_views.remember(self.io, self.tab());
     self.window.redraw();
 }
 

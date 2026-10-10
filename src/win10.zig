@@ -114,7 +114,7 @@ pub fn titleBar(self: *Files, kit: *Kit) void {
         var style = kit.style(.caption, text);
         style.wrap = .none;
         var buffer: [256]u8 = undefined;
-        u.text(kit.print("{s}", .{self.titleOf(t, &buffer)}), style);
+        u.text(kit.print("{s}", .{self.windowTitleOf(t, &buffer)}), style);
         if (u.justPressed()) {
             if (window.clickCount() >= 2) window.toggleMaximized() else window.startMove();
         }
@@ -709,12 +709,12 @@ fn viewTab(self: *Files, kit: *Kit) void {
         }
         if (check(kit, "ribbon/hidden", "Hidden items", self.show_hidden)) self.toggleHidden();
         smallColumnEnd(kit);
-        _ = large(kit, "ribbon/hide-selected", .eye_off, null, "Hide selected\nitems", false, false);
+        if (large(kit, "ribbon/hide-selected", .eye_off, null, "Hide selected\nitems", false, t.selectedCount() > 0 and t.writable())) actions.hideChosen(self);
     }
     {
         groupBegin(kit);
         defer groupEnd(kit, "");
-        _ = large(kit, "ribbon/options", .settings, null, "Options", false, false);
+        if (large(kit, "ribbon/options", .settings, null, "Options", true, true)) @import("options.zig").open(self);
     }
 }
 

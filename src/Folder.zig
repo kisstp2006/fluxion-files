@@ -32,13 +32,40 @@ pub const Entry = struct {
     /// In the Recycle Bin: its name there, and when it went in.
     stored: ?[]const u8 = null,
     deleted: i128 = 0,
+    /// Made and last opened, in nanoseconds since the epoch - nought
+    /// where the file system does not say; its owner, and its mode.
+    created: i128 = 0,
+    accessed: i128 = 0,
+    uid: u32 = 0,
+    mode: u32 = 0,
+
+    /// Windows' Attributes column: R for read-only, H for hidden, A for
+    /// archive - here a file, D a folder, L a link.
+    pub fn attributes(self: Entry, buffer: []u8) []const u8 {
+        var n: usize = 0;
+        const add = struct {
+            fn f(b: []u8, at: *usize, c: u8) void {
+                if (at.* < b.len) {
+                    b[at.*] = c;
+                    at.* += 1;
+                }
+            }
+        }.f;
+        if (self.mode != 0 and self.mode & 0o222 == 0) add(buffer, &n, 'R');
+        if (self.hidden) add(buffer, &n, 'H');
+        if (self.kind == .folder) add(buffer, &n, 'D') else if (self.kind == .file) add(buffer, &n, 'A');
+        if (self.link) add(buffer, &n, 'L');
+        return buffer[0..n];
+    }
 
     pub fn isFolder(self: Entry) bool {
         return self.kind == .folder;
     }
 };
 
-pub const Column = enum { name, modified, type, size };
+/// The columns Details can show, and what can be sorted and grouped by.
+pub const Column = enum { name, modified, type, size, created, accessed, attributes, owner };
+pub const column_count = @typeInfo(Column).@"enum".fields.len;
 
 /// An empty folder - for what is filled in by other means: a search, the
 /// Recycle Bin.
@@ -205,17 +232,22 @@ pub fn read(gpa: std.mem.Allocator, io: std.Io, mime: *const Mime, path: []const
         var entry: Entry = .{ .name = a.dupe(u8, item.name) catch continue, .kind = .other };
         entry.hidden = item.name[0] == '.' or listed(hidden_list, item.name);
         entry.link = item.kind == .sym_link;
-        // Followed through a link, to what it points at.
-        if (dir.statFile(io, item.name, .{})) |stat| {
-            entry.kind = switch (stat.kind) {
-                .directory => .folder,
-                .file => .file,
+        // Followed through a link, to what it points at - with when it was
+        // made and opened, and whose it is, for Details' other columns.
+        if (statxAt(dir.handle, item.name)) |sx| {
+            entry.kind = switch (sx.mode & std.os.linux.S.IFMT) {
+                std.os.linux.S.IFDIR => .folder,
+                std.os.linux.S.IFREG => .file,
                 else => .other,
             };
-            entry.size = stat.size;
-            entry.mtime = stat.mtime.nanoseconds;
-            entry.executable = stat.permissions.toMode() & 0o111 != 0;
-        } else |_| {
+            entry.size = sx.size;
+            entry.mtime = nanoseconds(sx.mtime);
+            entry.accessed = nanoseconds(sx.atime);
+            if (sx.mask.BTIME) entry.created = nanoseconds(sx.btime);
+            entry.uid = sx.uid;
+            entry.mode = sx.mode;
+            entry.executable = sx.mode & 0o111 != 0;
+        } else {
             entry.kind = switch (item.kind) {
                 .directory => .folder,
                 .file => .file,
@@ -255,6 +287,22 @@ pub fn deinit(self: *Folder) void {
     self.arena.deinit();
 }
 
+fn statxAt(dir: std.posix.fd_t, name: []const u8) ?std.os.linux.Statx {
+    const linux = std.os.linux;
+    var z: [std.fs.max_name_bytes + 1]u8 = undefined;
+    if (name.len >= z.len) return null;
+    @memcpy(z[0..name.len], name);
+    z[name.len] = 0;
+    var sx: linux.Statx = undefined;
+    const rc = linux.statx(dir, @ptrCast(&z), 0, .{ .TYPE = true, .MODE = true, .UID = true, .ATIME = true, .MTIME = true, .BTIME = true, .SIZE = true }, &sx);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    return sx;
+}
+
+fn nanoseconds(t: std.os.linux.statx_timestamp) i128 {
+    return @as(i128, t.sec) * std.time.ns_per_s + t.nsec;
+}
+
 /// Whether `name` is a line of the folder's `.hidden`.
 fn listed(list: []const u8, name: []const u8) bool {
     var lines = std.mem.tokenizeScalar(u8, list, '\n');
@@ -281,6 +329,14 @@ pub fn sort(self: *Folder, by: Column, ascending: bool, mime: *Mime) void {
             const order: std.math.Order = switch (c.by) {
                 .name => naturalOrder(a.name, b.name),
                 .modified => std.math.order(a.mtime, b.mtime),
+                .created => std.math.order(a.created, b.created),
+                .accessed => std.math.order(a.accessed, b.accessed),
+                .owner => std.math.order(a.uid, b.uid),
+                .attributes => blk: {
+                    var ab: [8]u8 = undefined;
+                    var bb: [8]u8 = undefined;
+                    break :blk std.mem.order(u8, a.attributes(&ab), b.attributes(&bb));
+                },
                 .size => std.math.order(a.size, b.size),
                 .type => blk: {
                     var ab: [64]u8 = undefined;

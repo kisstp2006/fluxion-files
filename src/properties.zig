@@ -36,6 +36,10 @@ pub const Sheet = struct {
     usage: ?Ops.Usage = null,
     /// The mode as it is to be: changed by the boxes, set by Apply.
     mode: u32 = 0,
+    /// Hidden - listed in its folder's `.hidden` - as it is, and as it is
+    /// to be.
+    hidden: bool = false,
+    hidden_was: bool = false,
 
     pub fn path(self: *const Sheet) []const u8 {
         return self.path_buffer[0..self.path_len];
@@ -48,13 +52,33 @@ pub fn open(self: *Files, path: []const u8, folder: bool, mime: []const u8) void
     @memcpy(sheet.path_buffer[0..sheet.path_len], path[0..sheet.path_len]);
     sheet.info = Ops.info(path) orelse .{};
     sheet.mode = sheet.info.mode;
+    sheet.hidden = listedHidden(self, path);
+    sheet.hidden_was = sheet.hidden;
     if (folder) sheet.usage = Ops.usage(self.io, path);
     self.properties = sheet;
     self.window.redraw();
 }
 
+/// Whether `path` is named in its folder's `.hidden`.
+fn listedHidden(self: *Files, path: []const u8) bool {
+    const dir = std.fs.path.dirname(path) orelse return false;
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const file = Ops.join(&buffer, dir, ".hidden") catch return false;
+    var text_buffer: [16384]u8 = undefined;
+    const text = std.Io.Dir.cwd().readFile(self.io, file, &text_buffer) catch return false;
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |listed| if (std.mem.eql(u8, std.mem.trimEnd(u8, listed, "\r"), std.fs.path.basename(path))) return true;
+    return false;
+}
+
 fn apply(self: *Files) void {
     const sheet = &(self.properties orelse return);
+    if (sheet.hidden != sheet.hidden_was) {
+        const dir = std.fs.path.dirname(sheet.path()) orelse "/";
+        Ops.setHidden(self.io, self.gpa, dir, &.{std.fs.path.basename(sheet.path())}, sheet.hidden) catch |err| self.notify("The item could not be hidden", err);
+        sheet.hidden_was = sheet.hidden;
+        self.refreshAll();
+    }
     if (sheet.mode & 0o7777 != sheet.info.mode & 0o7777) {
         Ops.setMode(sheet.path(), sheet.mode) catch |err| self.notify("The permissions could not be changed", err);
         sheet.info = Ops.info(sheet.path()) orelse sheet.info;
@@ -144,7 +168,7 @@ pub fn draw(self: *Files, kit: *Kit) void {
             self.properties = null;
             return;
         }
-        if (kit.button("properties/apply", "Apply", .{ .width = .fixed(80), .disabled = sheet.mode & 0o7777 == sheet.info.mode & 0o7777 })) apply(self);
+        if (kit.button("properties/apply", "Apply", .{ .width = .fixed(80), .disabled = sheet.mode & 0o7777 == sheet.info.mode & 0o7777 and sheet.hidden == sheet.hidden_was })) apply(self);
     }
 }
 
@@ -247,8 +271,12 @@ fn general(self: *Files, kit: *Kit, sheet: *Sheet, edge: ui.Color) void {
         if (kit.checkbox("properties/read-only", &read_only, "Read-only", .{})) {
             sheet.mode = if (read_only) sheet.mode & ~@as(u32, 0o222) else sheet.mode | 0o200;
         }
-        var hidden = name.len > 0 and name[0] == '.';
-        _ = kit.checkbox("properties/hidden", &hidden, "Hidden", .{ .disabled = true });
+        // Hidden: by a dot in front of its name - which only a new name
+        // changes - or listed in its folder's .hidden.
+        if (name.len > 0 and name[0] == '.') {
+            var dotted = true;
+            _ = kit.checkbox("properties/hidden", &dotted, "Hidden", .{ .disabled = true });
+        } else _ = kit.checkbox("properties/hidden", &sheet.hidden, "Hidden", .{});
     }
 }
 

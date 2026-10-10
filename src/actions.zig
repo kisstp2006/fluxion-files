@@ -295,6 +295,28 @@ pub fn copyAsPath(self: *Files) void {
     self.window.copyText(text.items);
 }
 
+/// Windows 10's "Hide selected items": what is chosen hidden - or, all of
+/// it hidden already, shown again.
+pub fn hideChosen(self: *Files) void {
+    const t = self.tab();
+    const dir = t.path() orelse return;
+    if (!t.writable()) return;
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(self.gpa);
+    var all_hidden = true;
+    for (t.selected.items, 0..) |s, i| {
+        if (!s) continue;
+        const e = t.entry(i);
+        // A name with a dot in front is hidden by its name alone.
+        if (e.name[0] == '.') continue;
+        if (!e.hidden) all_hidden = false;
+        names.append(self.gpa, e.name) catch {};
+    }
+    if (names.items.len == 0) return;
+    Ops.setHidden(self.io, self.gpa, dir, names.items, !all_hidden) catch |err| return self.notify("The items could not be hidden", err);
+    self.refresh();
+}
+
 /// Pin to Quick access: the chosen folders - or, none chosen, the folder
 /// shown - or take them off where they are pinned already.
 pub fn pinChosen(self: *Files) void {
