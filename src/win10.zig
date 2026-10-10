@@ -27,9 +27,11 @@ const Files = @import("Files.zig");
 const Tab = @import("Tab.zig");
 const Window = @import("Window.zig");
 const actions = @import("actions.zig");
+const Ops = @import("Ops.zig");
 const icons = @import("icons.zig");
 const property_sheet = @import("properties.zig");
 const menus_mod = @import("menus.zig");
+const archives = @import("archives.zig");
 
 pub const title_h = 31;
 const caption_w = 46;
@@ -237,6 +239,7 @@ pub fn ribbon(self: *Files, kit: *Kit) void {
             .recycle_bin => recycleBinTab(self, kit),
             .picture => pictureTab(self, kit),
             .drive => driveTab(self, kit),
+            .compressed => extractTab(self, kit),
             .search => {},
         },
         .search => searchTab(self, kit),
@@ -246,7 +249,7 @@ pub fn ribbon(self: *Files, kit: *Kit) void {
 // -- The tabs for what is shown: Windows 10's contextual tabs --
 
 const Contextual = struct {
-    what: enum { recycle_bin, picture, drive, search },
+    what: enum { recycle_bin, picture, drive, compressed, search },
     /// Over the tab, in its colour: "Recycle Bin Tools".
     header: []const u8,
     tab: Files.RibbonTab,
@@ -267,6 +270,12 @@ fn contextual(self: *Files) ?Contextual {
         },
         else => {},
     }
+    // A compressed folder chosen, or one gone into: "Compressed Folder
+    // Tools", in its own pink.
+    var archive_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    if (archives.chosenArchive(self, &archive_buffer) != null) {
+        return .{ .what = .compressed, .header = "Compressed Folder Tools", .tab = .manage, .name = "Extract", .colour = if (dark) widgets.argb(0xFF4A2A45) else widgets.argb(0xFFF5DDF0) };
+    }
     if (t.selectedCount() >= 1) if (t.current()) |i| if (std.mem.startsWith(u8, t.entry(i).mime, "image/")) {
         return .{ .what = .picture, .header = "Picture Tools", .tab = .manage, .name = "Manage", .colour = if (dark) widgets.argb(0xFF5C4A1E) else widgets.argb(0xFFFCEFC4) };
     };
@@ -284,9 +293,11 @@ fn contextualTab(self: *Files, kit: *Kit, c: Contextual) void {
     const p = &kit.theme.palette;
     const id = "ribbon/tab/contextual";
     const front = self.ribbon_tab == c.tab and !self.ribbon_folded;
+    // As wide as its header says, as Windows 10 sizes it.
+    const header_w: f32 = if (kit.ui.measurer) |m| @max(116, m.measure(c.header, kit.style(.caption, p.text_primary)).width + 24) else 116;
     u.open(.{
         .id = id,
-        .width = .fixed(116),
+        .width = .fixed(header_w),
         .height = .grow,
         .align_x = .center,
         .align_y = .center,
@@ -300,7 +311,7 @@ fn contextualTab(self: *Files, kit: *Kit, c: Contextual) void {
     }
     {
         u.open(.{
-            .width = .fixed(116),
+            .width = .fixed(header_w),
             .height = .fixed(title_h),
             .align_x = .center,
             .align_y = .center,
@@ -337,6 +348,56 @@ fn pictureTab(self: *Files, kit: *Kit) void {
         defer groupEnd(kit, "View");
         if (large(kit, "ribbon/background", .image, null, "Set as\nbackground", false, self.tab().selectedCount() == 1)) actions.setAsBackground(self);
         if (large(kit, "ribbon/open-picture", .open, null, "Open", false, true)) if (self.tab().current()) |i| self.open(i, false);
+    }
+}
+
+/// Compressed Folder Tools: take it out into one of the person's folders
+/// at once, or all of it where the wizard is told.
+fn extractTab(self: *Files, kit: *Kit) void {
+    const u = kit.ui;
+    var archive_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const archive = archives.chosenArchive(self, &archive_buffer) orelse return;
+    {
+        groupBegin(kit);
+        defer groupEnd(kit, "Extract To");
+        // The person's folders, two rows of three, as Windows 10's gallery.
+        u.open(.{ .direction = .top_to_bottom, .gap = 0 });
+        defer u.close();
+        const places = self.places.user.items;
+        var row: usize = 0;
+        while (row * 3 < @min(places.len, 6)) : (row += 1) {
+            u.open(.{ .gap = 0 });
+            defer u.close();
+            for (places[row * 3 .. @min(places.len, row * 3 + 3, 6)], row * 3..) |f, k| {
+                const id = kit.print("ribbon/extract-to/{d}", .{k});
+                const hovered = u.isPointerOver(id);
+                u.open(.{
+                    .id = id,
+                    .width = .fixed(104),
+                    .height = .fixed(30),
+                    .padding = .xy(4, 0),
+                    .gap = 6,
+                    .align_y = .center,
+                    .background_color = if (hovered) hoverColor(kit) else .transparent,
+                    .border = if (hovered) .{ .color = hoverEdge(kit), .width = .all(1) } else .{},
+                });
+                icons.themed(self, kit, icons.special(f.special), 24);
+                var style = kit.style(.caption, kit.theme.palette.text_primary);
+                style.wrap = .none;
+                u.text(f.name, style);
+                if (u.justReleased()) {
+                    var dest_buffer: [std.fs.max_path_bytes]u8 = undefined;
+                    const name = std.fs.path.stem(std.fs.path.basename(archive));
+                    archives.extractAll(self, archive, Ops.join(&dest_buffer, f.path, name) catch f.path, true);
+                }
+                u.close();
+            }
+        }
+    }
+    {
+        groupBegin(kit);
+        defer groupEnd(kit, "");
+        if (large(kit, "ribbon/extract-all", .folder_open, widgets.argb(0xFFE8B428), "Extract\nall", false, true)) archives.startWizard(self, archive);
     }
 }
 
@@ -494,8 +555,11 @@ fn check(kit: *Kit, id: []const u8, name: []const u8, on: bool) bool {
 fn homeTab(self: *Files, kit: *Kit) void {
     const t = self.tab();
     const chosen = t.selectedCount() > 0;
-    const one = t.selectedCount() == 1;
+    // In a compressed folder, nothing is changed: only copied out.
+    const changes = chosen and !t.inArchive();
+    const one = t.selectedCount() == 1 and !t.inArchive();
     const in_folder = t.path() != null;
+    const writable = t.writable();
     {
         groupBegin(kit);
         defer groupEnd(kit, "Clipboard");
@@ -504,25 +568,25 @@ fn homeTab(self: *Files, kit: *Kit) void {
         if (large(kit, "ribbon/paste", .clipboard_paste, null, "Paste", false, actions.canPaste(self))) actions.paste(self);
         smallColumnBegin(kit);
         defer smallColumnEnd(kit);
-        if (small(kit, "ribbon/cut", .cut, null, "Cut", false, chosen)) actions.copy(self, true);
+        if (small(kit, "ribbon/cut", .cut, null, "Cut", false, changes)) actions.copy(self, true);
         if (small(kit, "ribbon/copy-path", .copy, null, "Copy path", false, in_folder)) actions.copyAsPath(self);
         if (small(kit, "ribbon/paste-shortcut", .clipboard_paste, null, "Paste shortcut", false, actions.canPaste(self))) actions.pasteShortcut(self);
     }
     {
         groupBegin(kit);
         defer groupEnd(kit, "Organize");
-        if (large(kit, "ribbon/move-to", .folder_open, widgets.argb(0xFFE8B428), "Move\nto", true, chosen)) self.menu = .move_to;
-        if (large(kit, "ribbon/copy-to", .folder_open, widgets.argb(0xFFE8B428), "Copy\nto", true, chosen)) self.menu = .copy_to;
-        if (large(kit, "ribbon/delete", .dismiss, widgets.argb(0xFFE81123), "Delete", true, chosen)) actions.delete(self, false);
+        if (large(kit, "ribbon/move-to", .folder_open, widgets.argb(0xFFE8B428), "Move\nto", true, changes)) self.menu = .move_to;
+        if (large(kit, "ribbon/copy-to", .folder_open, widgets.argb(0xFFE8B428), "Copy\nto", true, changes)) self.menu = .copy_to;
+        if (large(kit, "ribbon/delete", .dismiss, widgets.argb(0xFFE81123), "Delete", true, changes)) actions.delete(self, false);
         if (large(kit, "ribbon/rename", .rename, null, "Rename", false, one)) if (t.current()) |i| self.startRename(i);
     }
     {
         groupBegin(kit);
         defer groupEnd(kit, "New");
-        if (large(kit, "ribbon/new-folder", .folder, widgets.argb(0xFFE8B428), "New\nfolder", false, in_folder)) actions.newFolder(self);
+        if (large(kit, "ribbon/new-folder", .folder, widgets.argb(0xFFE8B428), "New\nfolder", false, writable)) actions.newFolder(self);
         smallColumnBegin(kit);
         defer smallColumnEnd(kit);
-        if (small(kit, "ribbon/new-item", .document, null, "New item", true, in_folder)) self.menu = .new;
+        if (small(kit, "ribbon/new-item", .document, null, "New item", true, writable)) self.menu = .new;
         _ = small(kit, "ribbon/easy-access", .star, null, "Easy access", true, false);
     }
     {

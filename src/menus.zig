@@ -30,12 +30,13 @@ const Ops = @import("Ops.zig");
 const actions = @import("actions.zig");
 const apps_mod = @import("apps.zig");
 const icons = @import("icons.zig");
+const archives = @import("archives.zig");
 
 const menu_id = "context";
 const sub_id = "context/sub";
 
 /// The menus a row opens beside it.
-pub const Sub = enum { none, view, sort, group, new, send_to, open_with, show };
+pub const Sub = enum { none, view, sort, group, new, send_to, open_with, show, compress };
 
 /// Drawing the menu beside, not the menu itself: a row under the pointer
 /// there keeps it open.
@@ -240,6 +241,7 @@ pub fn subRowMarked(self: *Files, kit: *Kit, id: []const u8, content: []const u8
         .send_to => sendToMenu(self, kit),
         .open_with => openWithMenu(self, kit),
         .show => showMenu(self, kit),
+        .compress => archives.compressMenu(self, kit),
     }
 }
 
@@ -321,10 +323,15 @@ fn itemMenu(self: *Files, kit: *Kit) void {
             return actions.pinChosen(self);
         }
     }
-    if (row(self, kit, "context/zip", "Compress to ZIP file", .{ .icon = .folder, .disabled = t.path() == null })) {
-        done(self);
-        return actions.zip(self);
-    }
+    // A compressed folder: everything in it taken out, where it is told.
+    var archive_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    if (one) if (archives.chosenArchive(self, &archive_buffer)) |archive| if (!t.inArchive()) {
+        if (row(self, kit, "context/extract", "Extract All...", .{ .themed = "package-x-generic" })) {
+            done(self);
+            return archives.startWizard(self, archive);
+        }
+    };
+    subRow(self, kit, "context/compress", "Compress to...", .folder, .compress, !t.writable());
     if (row(self, kit, "context/path", "Copy as path", .{ .icon = .clipboard_paste, .shortcut = "Ctrl+Shift+C" })) {
         done(self);
         return actions.copyAsPath(self);
@@ -358,6 +365,13 @@ fn itemMenuFull(self: *Files, kit: *Kit) void {
         if (t.current()) |i| self.open(i, false);
         return;
     }
+    var archive_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    if (one and !t.inArchive()) if (archives.chosenArchive(self, &archive_buffer)) |archive| {
+        if (row(self, kit, "context/extract", "Extract All...", .{})) {
+            done(self);
+            return archives.startWizard(self, archive);
+        }
+    };
     if (folder and one) {
         if (row(self, kit, "context/open-window", "Open in new window", .{})) {
             done(self);

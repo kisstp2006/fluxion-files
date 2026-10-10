@@ -325,6 +325,8 @@ fn listView(self: *Files, kit: *Kit) void {
 fn answerDrop(self: *Files, u: *ui.Ui) void {
     if (!self.window.dragOver() or !u.isPointerOver(scroll_id)) return;
     const t = self.tab();
+    // Nothing is put into a compressed folder.
+    if (t.inArchive()) return;
     var buffer: [32]u8 = undefined;
     for (0..t.count()) |i| {
         const id = std.fmt.bufPrint(&buffer, "item/{d}", .{i}) catch continue;

@@ -52,6 +52,8 @@ const Player = @import("Player.zig");
 const Jobs = @import("Jobs.zig");
 const Undo = @import("Undo.zig");
 const progress = @import("progress.zig");
+const archives = @import("archives.zig");
+const Archive = @import("Archive.zig");
 
 const Files = @This();
 
@@ -198,6 +200,11 @@ progress_folded: bool = false,
 /// "Let me decide for each file": for which job, and which side of each
 /// name taken is kept.
 deciding: ?u32 = null,
+/// "Extract Compressed (Zipped) Folders", open; and the folder to show
+/// once what it takes out is out.
+wizard: ?archives.Wizard = null,
+show_after_buffer: [std.fs.max_path_bytes]u8 = undefined,
+show_after_len: usize = 0,
 decide_source: std.ArrayList(bool) = .empty,
 decide_dest: std.ArrayList(bool) = .empty,
 
@@ -651,7 +658,7 @@ pub fn notice(self: *const Files) ?[]const u8 {
 /// Type a new name for item `i`, in its place.
 pub fn startRename(self: *Files, i: usize) void {
     const t = self.tab();
-    if (t.path() == null or i >= t.count()) return;
+    if (!t.writable() or i >= t.count()) return;
     self.renaming = i;
     self.rename_draws = 0;
     t.focus = i;
@@ -737,10 +744,14 @@ pub fn open(self: *Files, i: usize, new_tab: bool) void {
     const dir = t.dirOf(e) orelse return;
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const full = std.fmt.bufPrint(&buffer, "{s}/{s}", .{ if (std.mem.eql(u8, dir, "/")) "" else dir, e.name }) catch return;
-    if (e.isFolder()) {
+    // A compressed folder opens as a folder, as Windows opens one.
+    const folder = e.isFolder() or (Archive.named(e.name) and Archive.available() and !t.inArchive());
+    if (folder) {
         if (new_tab and !self.ten()) self.newTab(.{ .folder = full }) else self.goTo(.{ .folder = full });
         return;
     }
+    // In one: taken out first.
+    if (t.inArchive()) return archives.openInside(self, i);
     self.openFile(full, e.mime);
 }
 
@@ -875,6 +886,7 @@ fn draw(context: *anyopaque, window: *Window, kit: *Kit) void {
     menus.context(self, kit);
     menus.confirmDialog(self, kit);
     progress.draw(self, kit);
+    archives.wizard(self, kit);
     property_sheet.draw(self, kit);
     drag.tip(self, kit);
     // A right or middle click on nothing that took it.
@@ -931,6 +943,10 @@ fn key(context: *anyopaque, window: *Window, sym: xkb.Keysym) bool {
     }
     if (self.properties != null) {
         if (code == K.Escape) self.properties = null;
+        return code == K.Escape;
+    }
+    if (self.wizard != null) {
+        if (code == K.Escape) self.wizard = null;
         return code == K.Escape;
     }
     if (self.confirm != null) {

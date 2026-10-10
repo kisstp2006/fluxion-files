@@ -62,7 +62,10 @@ pub fn follow(self: *Files, kit: *Kit) void {
 
     for (self.dragged.items) |p| self.gpa.free(p);
     self.dragged.clearRetainingCapacity();
-    for (t.selected.items, 0..) |chosen, i| {
+    // Out of a compressed folder: taken out first, and that dragged.
+    if (t.inArchive()) {
+        if (!@import("archives.zig").extractChosen(self, &self.dragged)) return;
+    } else for (t.selected.items, 0..) |chosen, i| {
         if (!chosen) continue;
         const e = t.entry(i);
         const dir = t.dirOf(e) orelse continue;

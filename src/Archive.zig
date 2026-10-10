@@ -51,6 +51,9 @@ const Lib = struct {
     entry_is_encrypted: *const fn (*EntryHandle) callconv(.c) c_int,
     write_new: *const fn () callconv(.c) ?*Handle,
     write_set_format_zip: *const fn (*Handle) callconv(.c) c_int,
+    write_set_format_7zip: *const fn (*Handle) callconv(.c) c_int,
+    write_set_format_pax_restricted: *const fn (*Handle) callconv(.c) c_int,
+    write_add_filter_gzip: *const fn (*Handle) callconv(.c) c_int,
     write_set_options: *const fn (*Handle, [*:0]const u8) callconv(.c) c_int,
     write_open_filename: *const fn (*Handle, [*:0]const u8) callconv(.c) c_int,
     write_header: *const fn (*Handle, *EntryHandle) callconv(.c) c_int,
@@ -101,6 +104,23 @@ pub fn available() bool {
 
 /// The endings of the archives this opens as folders.
 const extensions = [_][]const u8{ ".zip", ".7z", ".rar", ".tar", ".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2", ".tbz2", ".tbz", ".tar.zst", ".tzst", ".tar.lz", ".tar.lzma", ".cab", ".cpio", ".xar" };
+
+/// A path through a compressed folder - "/home/k/a.zip/docs" - split
+/// where the archive is: the archive, and the folder inside it ("docs",
+/// or "" for its top). Null for a path that goes through none.
+pub fn split(io: std.Io, path: []const u8) ?struct { archive: []const u8, inner: []const u8 } {
+    var end: usize = 0;
+    while (end < path.len) {
+        end = std.mem.indexOfScalarPos(u8, path, end + 1, '/') orelse path.len;
+        const prefix = path[0..end];
+        if (!named(prefix)) continue;
+        const stat = std.Io.Dir.cwd().statFile(io, prefix, .{}) catch return null;
+        if (stat.kind != .file) continue;
+        const inner = if (end < path.len) std.mem.trim(u8, path[end..], "/") else "";
+        return .{ .archive = prefix, .inner = inner };
+    }
+    return null;
+}
 
 /// Whether a file of this name is a compressed folder.
 pub fn named(name: []const u8) bool {
@@ -285,16 +305,57 @@ fn chosen(name: []const u8, wanted: []const []const u8) bool {
     return false;
 }
 
+/// What Windows 11's "Compress to" makes.
+pub const Format = enum {
+    zip,
+    seven_zip,
+    tar_gz,
+
+    pub fn extension(self: Format) []const u8 {
+        return switch (self) {
+            .zip => ".zip",
+            .seven_zip => ".7z",
+            .tar_gz => ".tar.gz",
+        };
+    }
+
+    /// What a file's name says it is, to be made: a ZIP unless it says.
+    pub fn of(name: []const u8) Format {
+        const ends = struct {
+            fn f(n: []const u8, e: []const u8) bool {
+                return n.len > e.len and std.ascii.eqlIgnoreCase(n[n.len - e.len ..], e);
+            }
+        }.f;
+        if (ends(name, ".7z")) return .seven_zip;
+        if (ends(name, ".tar.gz") or ends(name, ".tgz")) return .tar_gz;
+        return .zip;
+    }
+};
+
 /// A ZIP at `path` of `sources` - files and folders, each by its full path
 /// - named inside it as they are named where they are: what Windows' "Send
 /// to Compressed (zipped) folder" makes.
 pub fn createZip(io: std.Io, path: []const u8, sources: []const []const u8, progress: ?Progress) !void {
+    return create(io, path, sources, .zip, progress);
+}
+
+/// The same, as `format` has it: a ZIP, a 7z, a gzipped tar.
+pub fn create(io: std.Io, path: []const u8, sources: []const []const u8, format: Format, progress: ?Progress) !void {
     const l = library() orelse return error.NoLibarchive;
     const a = l.write_new() orelse return error.OutOfMemory;
     defer _ = l.write_free(a);
-    if (l.write_set_format_zip(a) != ok) return error.NoZip;
-    // Names in UTF-8, as Windows' own ZIPs have them since Windows 10.
-    _ = l.write_set_options(a, "zip:hdrcharset=UTF-8");
+    switch (format) {
+        .zip => {
+            if (l.write_set_format_zip(a) != ok) return error.NoZip;
+            // Names in UTF-8, as Windows' own ZIPs have them since Windows 10.
+            _ = l.write_set_options(a, "zip:hdrcharset=UTF-8");
+        },
+        .seven_zip => if (l.write_set_format_7zip(a) != ok) return error.No7z,
+        .tar_gz => {
+            if (l.write_set_format_pax_restricted(a) != ok) return error.NoTar;
+            if (l.write_add_filter_gzip(a) != ok) return error.NoGzip;
+        },
+    }
     var z: [std.fs.max_path_bytes + 1]u8 = undefined;
     const pz = try std.fmt.bufPrintZ(&z, "{s}", .{path});
     if (l.write_open_filename(a, pz.ptr) != ok) return error.CannotWrite;
@@ -394,4 +455,20 @@ test "a folder zipped is read back, and taken out whole" {
     try extract(io, zip, out, null, null);
     var read_buffer: [16]u8 = undefined;
     try std.testing.expectEqualStrings("hello", try tmp.dir.readFile(io, "out/src/inner/hello.txt", &read_buffer));
+}
+
+test "a path through a compressed folder is split where it is" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "photos.zip", .data = "PK" });
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(io, &root_buffer)];
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const inside = try std.fmt.bufPrint(&buffer, "{s}/photos.zip/2024/june", .{root});
+    const parts = split(io, inside).?;
+    try std.testing.expect(std.mem.endsWith(u8, parts.archive, "/photos.zip"));
+    try std.testing.expectEqualStrings("2024/june", parts.inner);
+    try std.testing.expect(split(io, root) == null);
+    try std.testing.expectEqual(Format.seven_zip, Format.of("a.7z"));
 }

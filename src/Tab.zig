@@ -177,6 +177,18 @@ pub fn lists(self: *const Tab) bool {
     };
 }
 
+/// Whether the folder shown is inside a compressed folder: read, not
+/// written.
+pub fn inArchive(self: *const Tab) bool {
+    const f = self.folder orelse return false;
+    return f.archive != null;
+}
+
+/// Whether things can be made, pasted, renamed and deleted here.
+pub fn writable(self: *const Tab) bool {
+    return self.path() != null and !self.inArchive();
+}
+
 /// The folder holding the one shown: none above the root.
 pub fn parentPath(self: *const Tab) ?[]const u8 {
     const p = self.path() orelse return null;

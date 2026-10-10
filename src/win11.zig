@@ -19,6 +19,7 @@ const Color = ui.Color;
 const Files = @import("Files.zig");
 const Window = @import("Window.zig");
 const actions = @import("actions.zig");
+const archives = @import("archives.zig");
 const drag = @import("drag.zig");
 const chrome = @import("chrome.zig");
 
@@ -193,8 +194,10 @@ pub fn commandBar(self: *Files, kit: *Kit) void {
     const u = kit.ui;
     const p = &kit.theme.palette;
     const t = self.tab();
-    const in_folder = t.path() != null;
+    const in_folder = t.writable();
     const chosen = t.selectedCount() > 0;
+    // In a compressed folder, nothing is changed: only copied out.
+    const changes = chosen and !t.inArchive();
     u.open(.{
         .id = "commandbar",
         .width = .grow,
@@ -208,14 +211,14 @@ pub fn commandBar(self: *Files, kit: *Kit) void {
     defer u.close();
     if (menuButton(kit, "cmd/new", .add, "New", in_folder, true)) self.menu = if (self.menu == .new) .none else .new;
     divider(kit);
-    if (commandButton(kit, "cmd/cut", .cut, "Cut (Ctrl+X)", chosen)) actions.copy(self, true);
+    if (commandButton(kit, "cmd/cut", .cut, "Cut (Ctrl+X)", changes)) actions.copy(self, true);
     if (commandButton(kit, "cmd/copy", .copy, "Copy (Ctrl+C)", chosen)) actions.copy(self, false);
     if (commandButton(kit, "cmd/paste", .clipboard_paste, "Paste (Ctrl+V)", actions.canPaste(self))) actions.paste(self);
-    if (commandButton(kit, "cmd/rename", .rename, "Rename (F2)", t.selectedCount() == 1)) if (t.current()) |i| self.startRename(i);
+    if (commandButton(kit, "cmd/rename", .rename, "Rename (F2)", t.selectedCount() == 1 and !t.inArchive())) if (t.current()) |i| self.startRename(i);
     if (commandButton(kit, "cmd/share", .share, "Share", chosen)) actions.email(self);
-    if (commandButton(kit, "cmd/delete", .delete, "Delete (Del)", chosen)) actions.delete(self, false);
+    if (commandButton(kit, "cmd/delete", .delete, "Delete (Del)", changes)) actions.delete(self, false);
     divider(kit);
-    if (menuButton(kit, "cmd/sort", .arrow_sort, "Sort", in_folder, false)) self.menu = if (self.menu == .sort) .none else .sort;
+    if (menuButton(kit, "cmd/sort", .arrow_sort, "Sort", t.path() != null, false)) self.menu = if (self.menu == .sort) .none else .sort;
     if (menuButton(kit, "cmd/view", .grid, "View", true, false)) self.menu = if (self.menu == .view) .none else .view;
     // The Recycle Bin's own: emptied, or what is in it put back.
     if (t.location == .trash) {
@@ -225,6 +228,11 @@ pub fn commandBar(self: *Files, kit: *Kit) void {
     }
     // What the chosen file is: a picture can be the wallpaper, an archive
     // taken out of.
+    var archive_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    if (archives.chosenArchive(self, &archive_buffer)) |archive| {
+        divider(kit);
+        if (labelButton(kit, "cmd/extract", .folder_open, "Extract all")) archives.startWizard(self, archive);
+    }
     if (t.current()) |i| if (t.selectedCount() == 1) {
         const e = t.entry(i);
         if (std.mem.startsWith(u8, e.mime, "image/")) {

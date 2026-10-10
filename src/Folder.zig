@@ -7,6 +7,7 @@
 const std = @import("std");
 
 const Mime = @import("Mime.zig");
+const Archive = @import("Archive.zig");
 
 const Folder = @This();
 
@@ -170,6 +171,11 @@ extern fn mktime(tm: *Tm) i64;
 arena: std.heap.ArenaAllocator,
 path: []const u8,
 entries: std.ArrayList(Entry) = .empty,
+/// A folder inside a compressed folder: the archive, and where in it.
+/// What is in it is read, not written: nothing is made, renamed or
+/// deleted there.
+archive: ?[]const u8 = null,
+inner: []const u8 = "",
 /// Why it could not be read, if it could not.
 failure: ?anyerror = null,
 
@@ -179,6 +185,13 @@ pub fn read(gpa: std.mem.Allocator, io: std.Io, mime: *const Mime, path: []const
     const a = self.arena.allocator();
     self.path = a.dupe(u8, path) catch path;
     var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| {
+        // A compressed folder, or a folder in one: what the archive says.
+        if (Archive.split(io, path)) |parts| {
+            readArchive(&self, mime, parts.archive, parts.inner) catch |e| {
+                self.failure = e;
+            };
+            return self;
+        }
         self.failure = err;
         return self;
     };
@@ -213,6 +226,29 @@ pub fn read(gpa: std.mem.Allocator, io: std.Io, mime: *const Mime, path: []const
         self.entries.append(a, entry) catch continue;
     }
     return self;
+}
+
+/// The folder `inner` of the archive at `archive`: what is right in it.
+fn readArchive(self: *Folder, mime: *const Mime, archive: []const u8, inner: []const u8) !void {
+    const a = self.arena.allocator();
+    self.archive = try a.dupe(u8, archive);
+    self.inner = try a.dupe(u8, inner);
+    var all: std.ArrayList(Archive.Entry) = .empty;
+    try Archive.list(a, archive, &all);
+    for (all.items) |e| {
+        const parent = std.fs.path.dirname(e.path) orelse "";
+        if (!std.mem.eql(u8, parent, inner)) continue;
+        const name = std.fs.path.basename(e.path);
+        var entry: Entry = .{
+            .name = name,
+            .kind = if (e.kind == .folder) .folder else .file,
+            .size = e.size,
+            .mtime = @as(i128, e.mtime) * std.time.ns_per_s,
+            .hidden = name.len > 0 and name[0] == '.',
+        };
+        entry.mime = if (entry.kind == .folder) Mime.directory else mime.byName(name) orelse Mime.unknown;
+        try self.entries.append(a, entry);
+    }
 }
 
 pub fn deinit(self: *Folder) void {

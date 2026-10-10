@@ -12,6 +12,7 @@ const Ops = @import("Ops.zig");
 const Look = @import("Look.zig");
 const apps = @import("apps.zig");
 const Jobs = @import("Jobs.zig");
+const archives = @import("archives.zig");
 const Undo = @import("Undo.zig");
 
 const log = std.log.scoped(.actions);
@@ -38,6 +39,8 @@ fn clearClipboard(self: *Files) void {
 /// Kept to be pasted - and, cut, moved when it is.
 pub fn copy(self: *Files, cut: bool) void {
     if (self.tab().selectedCount() == 0) return;
+    // Nothing is taken out of a compressed folder but by copying.
+    if (cut and self.tab().inArchive()) return;
     clearClipboard(self);
     chosenPaths(self, &self.clipboard);
     self.clipboard_cut = cut;
@@ -82,7 +85,7 @@ pub fn fileUri(path: []const u8, buffer: []u8) []const u8 {
 }
 
 pub fn canPaste(self: *Files) bool {
-    return self.clipboard.items.len > 0 and self.tab().path() != null;
+    return self.clipboard.items.len > 0 and self.tab().writable();
 }
 
 /// What was copied or cut, here - copied or moved on a thread of its own,
@@ -91,7 +94,9 @@ pub fn canPaste(self: *Files) bool {
 pub fn paste(self: *Files) void {
     const t = self.tab();
     const dir = t.path() orelse return;
-    if (self.clipboard.items.len == 0) return;
+    if (self.clipboard.items.len == 0 or !t.writable()) return;
+    // Copied out of a compressed folder: taken out of it, here.
+    if (archives.pasteFromArchive(self, dir)) return;
     self.jobs.start(if (self.clipboard_cut) .move else .copy, @ptrCast(self.clipboard.items), dir, null);
     // Cut, it is pasted once: gone from where it was.
     if (self.clipboard_cut) clearClipboard(self);
@@ -132,6 +137,17 @@ pub fn jobsDone(self: *Files) bool {
         };
     };
     choose(self, names.items);
+    // "Show extracted files when complete": the folder they went into.
+    if (self.show_after_len > 0) for (done.items) |j| {
+        if (j.kind != .extract or j.state != .done) continue;
+        const want = self.show_after_buffer[0..self.show_after_len];
+        if (!std.mem.eql(u8, j.dest, want)) continue;
+        self.show_after_len = 0;
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const copy_of = std.fmt.bufPrint(&buffer, "{s}", .{want}) catch break;
+        self.goTo(.{ .folder = copy_of });
+        break;
+    };
     for (done.items) |j| self.jobs.release(j);
     return true;
 }
@@ -156,7 +172,7 @@ pub fn choose(self: *Files, names: []const []const u8) void {
 pub fn delete(self: *Files, permanent: bool) void {
     const t = self.tab();
     const n = t.selectedCount();
-    if (n == 0 or !t.lists()) return;
+    if (n == 0 or !t.lists() or t.inArchive()) return;
     // From the Recycle Bin, nothing is deleted but for good.
     if (permanent or t.location == .trash) {
         self.confirm = .delete_permanently;
@@ -196,6 +212,7 @@ pub fn deleteChosen(self: *Files, permanent: bool) void {
 pub fn newFolder(self: *Files) void {
     const t = self.tab();
     const dir = t.path() orelse return;
+    if (!t.writable()) return;
     self.menu = .none;
     var buffer: [256]u8 = undefined;
     const name = Ops.newFolder(self.io, dir, &buffer) catch |err| return self.notify("The folder could not be made", err);
@@ -208,6 +225,7 @@ pub fn newFolder(self: *Files) void {
 pub fn newTextFile(self: *Files) void {
     const t = self.tab();
     const dir = t.path() orelse return;
+    if (!t.writable()) return;
     self.menu = .none;
     var buffer: [256]u8 = undefined;
     const name = Ops.newTextFile(self.io, dir, &buffer) catch |err| return self.notify("The document could not be made", err);
